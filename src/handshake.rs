@@ -19,7 +19,6 @@ pub mod cipher_suites {
     #[derive(Debug, Copy, Clone)]
     pub struct CipherSuite([u8; 2]);
     impl AsRef<[u8]> for CipherSuite {
-        #[must_use]
         fn as_ref(&self) -> &[u8] {
             &self.0
         }
