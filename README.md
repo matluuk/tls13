@@ -42,13 +42,13 @@ Read the chapter in Rust's book about [ownership.](https://doc.rust-lang.org/boo
 
 This project attempts to avoid some complex features of Rust.
 You don't need to know lifetimes to complete the TLS handshake and decrypt application data content. It is okay to make
-additional copying on this project
+additional copying (cloning!) on this project
 with the cost of performance and increased memory usage.
 
 For general guidance, check
 
 * [The Rust Book](https://doc.rust-lang.org/book/)
-* You can use ChatGPT, Copilot, or other LLM, for example, to explain some complex lines of code. They are usually very
+* You can use ChatGPT, Claude, Copilot, or other LLMs, for example, to explain some complex lines of code. They are usually very
   accurate.
 
 To get started with Rust environment, use [Rustup.](https://www.rust-lang.org/tools/install)
@@ -93,7 +93,7 @@ message and convert it into raw bytes with correct length determinants.
 
 It also implements minimal data structures and decoders to parse the first TLS Record from the server response, which
 includes the `ServerHello` message. However, extensions are not parsed to correct structures.
-They are left on purpose to give a somewhat easy starting point.
+**They are left on purpose to give a somewhat easy starting point.**
 
 As a result, the following output log can be seen:
 
