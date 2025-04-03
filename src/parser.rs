@@ -17,25 +17,41 @@ impl ByteParser {
     }
     /// Consume 2 bytes from the deque and convert to u16
     pub fn get_u16(&mut self) -> Option<u16> {
+        // Check if we have at least 2 bytes
+        if self.deque.len() < 2 {
+            return None;
+        }
         Some(u16::from_be_bytes(
             self.deque.drain(..2).collect::<Vec<u8>>().try_into().ok()?,
         ))
     }
     /// Consume 3 bytes from the deque and convert to u24 wrapped as u32
     pub fn get_u24(&mut self) -> Option<u32> {
+        // Check if we have at least 3 bytes
+        if self.deque.len() < 3 {
+            return None;
+        }
         let mut tmp = vec![0u8]; // Need 4 bytes to convert to u32
         tmp.extend(self.deque.drain(..3).collect::<Vec<u8>>());
         Some(u32::from_be_bytes(tmp.try_into().ok()?))
     }
     /// Consume 4 bytes from the deque and convert to u32
     pub fn get_u32(&mut self) -> Option<u32> {
+        // Check if we have at least 4 bytes
+        if self.deque.len() < 4 {
+            return None;
+        }
         Some(u32::from_be_bytes(
             self.deque.drain(..4).collect::<Vec<u8>>().try_into().ok()?,
         ))
     }
     /// Consume `count` bytes from the deque and convert to `Vec<u8>`
     pub fn get_bytes(&mut self, count: usize) -> Vec<u8> {
-        // TODO bound check, will panic. Oops...
+        // Add bounds checking to prevent panic
+        if self.deque.len() < count {
+            // Return empty vector if not enough bytes are available
+            return Vec::new();
+        }
         self.deque.drain(..count).collect::<Vec<u8>>()
     }
     /// Consume all bytes from the deque
