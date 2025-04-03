@@ -59,22 +59,51 @@ impl Extension {
         let ext_data = bytes.get_bytes(ext_data_len as usize);
         let mut ext_bytes = ByteParser::from(ext_data);
         debug!("Extension data: {:?}", ext_bytes);
-        // let extension_data = match ext_type {
+        let extension_data = match ext_type {
         // TODO Implement the rest of the extension types
-        //     0 => ExtensionData::ServerName(*ServerNameList::from_bytes(&mut ext_bytes)?),
-        //     _ => {
-        //         warn!("Unknown ExtensionType: {}", ext_type);
-        //         return Err(std::io::Error::new(
-        //             std::io::ErrorKind::InvalidData,
-        //             "Invalid extension data",
-        //         ));
-        //     }
-        // };
+            0 => ExtensionData::ServerName(*ServerNameList::from_bytes(&mut ext_bytes)?),
+            51 => {
+                // KeyShare extension - handle differently based on origin
+                if origin == ExtensionOrigin::Server {
+                    debug!("Parsing KeyShareServerHello extension");
+                    ExtensionData::KeyShareServerHello(*KeyShareServerHello::from_bytes(&mut ext_bytes)?)
+                } else {
+                    debug!("Parsing KeyShareClientHello extension");
+                    ExtensionData::KeyShareClientHello(*KeyShareClientHello::from_bytes(&mut ext_bytes)?)
+                }
+            },
+            43 => {
+                // SupportedVersions extension
+                debug!("Parsing SupportedVersions extension");
+                if origin == ExtensionOrigin::Server {
+                    // For server, parse as selected version
+                    let version = ext_bytes.get_u16().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid version")
+                    })?;
+                    ExtensionData::SupportedVersions(SupportedVersions {
+                        version: VersionKind::Selected(version),
+                    })
+                } else {
+                    ExtensionData::Unserialized(ext_bytes.drain())
+                }
+            },
+            // 10 => {
+            //     debug!("Parsing SupportedGroups extension");
+            //     ExtensionData::SupportedGroups(*NamedGroupList::from_bytes(&mut ext_bytes)?)
+            // },
+            _ => {
+                warn!("Unknown ExtensionType: {}", ext_type);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid extension data",
+                ));
+            }
+        };
         // Use placeholder `Unserialized` for now, not all extension data types are implemented
         Ok(Box::new(Extension {
             origin,
             extension_type: ext_type.into(),
-            extension_data: ExtensionData::Unserialized(ext_bytes.drain()),
+            extension_data,
         }))
     }
 }
@@ -223,7 +252,19 @@ impl ByteSerializable for SupportedVersions {
         if bytes.len() > 2 {
             todo!("We don't support receiving ClientHello")
         } else {
-            todo!("Serialize Selected variant")
+            // Server format: just a single selected version (2 bytes)
+            let selected_version = bytes.get_u16().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid selected version"
+                )
+            })?;
+            
+            debug!("Server selected version: {:04x}", selected_version);
+            
+            Ok(Box::new(SupportedVersions {
+                version: VersionKind::Selected(selected_version),
+            }))
         }
     }
 }
@@ -294,9 +335,76 @@ impl ByteSerializable for ServerNameList {
         );
         Some(bytes)
     }
-
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement ServerNameList from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        // First get the total length of the list
+        let list_len = bytes.get_u16().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid server name list length"
+            )
+        })?;
+        
+        let mut server_name_list = Vec::new();
+        let mut remaining = list_len as usize;
+        
+        while remaining > 0 && !bytes.is_empty() {
+            // Get the name type (1 byte)
+            let name_type = bytes.get_u8().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid name type"
+                )
+            })?;
+            
+            // Currently only HostName (0) is defined
+            if name_type != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unsupported name type: {}", name_type)
+                ));
+            }
+            
+            // Get the host name length (2 bytes)
+            let host_name_len = bytes.get_u16().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid host name length"
+                )
+            })?;
+            
+            // Get the host name bytes
+            let host_name = bytes.get_bytes(host_name_len as usize);
+            if host_name.len() != host_name_len as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Insufficient host name data"
+                ));
+            }
+            
+            // Add the server name to the list
+            server_name_list.push(ServerName {
+                name_type: NameType::HostName,
+                host_name,
+            });
+            
+            // Update remaining bytes counter
+            // 1 byte for name_type + 2 bytes for host_name_len + host_name_len bytes
+            remaining = remaining.saturating_sub(3 + host_name_len as usize);
+        }
+        
+        // Ensure we consumed exactly the amount specified by list_len
+        if remaining > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed server name list data"
+            ));
+        }
+        
+        debug!("Parsed ServerNameList with {} entries", server_name_list.len());
+        
+        Ok(Box::new(ServerNameList {
+            server_name_list,
+        }))
     }
 }
 
@@ -441,7 +549,35 @@ impl ByteSerializable for NamedGroupList {
     }
 
     fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement NamedGroupList from_bytes")
+        // First get the length of the list
+        let list_len = _bytes.get_u16().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid named group list length"
+            )
+        })?;
+        
+        let mut named_group_list = Vec::new();
+        let mut remaining = list_len as usize;
+        
+        // Each named group is 2 bytes
+        while remaining >= 2 && !_bytes.is_empty() {
+            let group = *NamedGroup::from_bytes(_bytes)?;
+            named_group_list.push(group);
+            remaining -= 2;
+        }
+        
+        // Make sure we consumed exactly the amount of bytes specified by list_len
+        if remaining > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed named group list data"
+            ));
+        }
+        
+        Ok(Box::new(NamedGroupList {
+            named_group_list,
+        }))
     }
 }
 
@@ -466,8 +602,31 @@ impl ByteSerializable for KeyShareEntry {
         Some(bytes)
     }
 
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement KeyShareEntry from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        // First parse the named group
+        let group = *NamedGroup::from_bytes(bytes)?;
+        
+        // Then get the length of the key exchange data
+        let key_exchange_len = bytes.get_u16().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid key exchange length"
+            )
+        })?;
+        
+        // Extract the key exchange data
+        let key_exchange = bytes.get_bytes(key_exchange_len as usize);
+        if key_exchange.len() != key_exchange_len as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Insufficient key exchange data"
+            ));
+        }
+        
+        Ok(Box::new(KeyShareEntry {
+            group,
+            key_exchange,
+        }))
     }
 }
 
