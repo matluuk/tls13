@@ -60,18 +60,34 @@ impl Extension {
         let mut ext_bytes = ByteParser::from(ext_data);
         debug!("Extension data: {:?}", ext_bytes);
         let extension_data = match ext_type {
-        // TODO Implement the rest of the extension types
+            // TODO Implement the rest of the extension types
             0 => ExtensionData::ServerName(*ServerNameList::from_bytes(&mut ext_bytes)?),
+            10 => {
+                // SupportedGroups extension
+                debug!("Parsing SupportedGroups extension");
+                ExtensionData::SupportedGroups(*NamedGroupList::from_bytes(&mut ext_bytes)?)
+            }
+            13 => {
+                // SignatureAlgorithms extension
+                debug!("Parsing SignatureAlgorithms extension");
+                ExtensionData::SignatureAlgorithms(*SupportedSignatureAlgorithms::from_bytes(
+                    &mut ext_bytes,
+                )?)
+            }
             51 => {
                 // KeyShare extension - handle differently based on origin
                 if origin == ExtensionOrigin::Server {
                     debug!("Parsing KeyShareServerHello extension");
-                    ExtensionData::KeyShareServerHello(*KeyShareServerHello::from_bytes(&mut ext_bytes)?)
+                    ExtensionData::KeyShareServerHello(*KeyShareServerHello::from_bytes(
+                        &mut ext_bytes,
+                    )?)
                 } else {
                     debug!("Parsing KeyShareClientHello extension");
-                    ExtensionData::KeyShareClientHello(*KeyShareClientHello::from_bytes(&mut ext_bytes)?)
+                    ExtensionData::KeyShareClientHello(*KeyShareClientHello::from_bytes(
+                        &mut ext_bytes,
+                    )?)
                 }
-            },
+            }
             43 => {
                 // SupportedVersions extension
                 debug!("Parsing SupportedVersions extension");
@@ -86,11 +102,14 @@ impl Extension {
                 } else {
                     ExtensionData::Unserialized(ext_bytes.drain())
                 }
-            },
-            // 10 => {
-            //     debug!("Parsing SupportedGroups extension");
-            //     ExtensionData::SupportedGroups(*NamedGroupList::from_bytes(&mut ext_bytes)?)
-            // },
+            }
+            45 => {
+                // PskKeyExchangeModes extension
+                debug!("Parsing PskKeyExchangeModes extension");
+                ExtensionData::PskKeyExchangeModes(*PskKeyExchangeModes::from_bytes(
+                    &mut ext_bytes,
+                )?)
+            }
             _ => {
                 warn!("Unknown ExtensionType: {}", ext_type);
                 return Err(std::io::Error::new(
@@ -99,7 +118,6 @@ impl Extension {
                 ));
             }
         };
-        // Use placeholder `Unserialized` for now, not all extension data types are implemented
         Ok(Box::new(Extension {
             origin,
             extension_type: ext_type.into(),
@@ -254,14 +272,11 @@ impl ByteSerializable for SupportedVersions {
         } else {
             // Server format: just a single selected version (2 bytes)
             let selected_version = bytes.get_u16().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid selected version"
-                )
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid selected version")
             })?;
-            
+
             debug!("Server selected version: {:04x}", selected_version);
-            
+
             Ok(Box::new(SupportedVersions {
                 version: VersionKind::Selected(selected_version),
             }))
@@ -340,71 +355,66 @@ impl ByteSerializable for ServerNameList {
         let list_len = bytes.get_u16().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Invalid server name list length"
+                "Invalid server name list length",
             )
         })?;
-        
+
         let mut server_name_list = Vec::new();
         let mut remaining = list_len as usize;
-        
+
         while remaining > 0 && !bytes.is_empty() {
             // Get the name type (1 byte)
             let name_type = bytes.get_u8().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid name type"
-                )
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid name type")
             })?;
-            
+
             // Currently only HostName (0) is defined
             if name_type != 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Unsupported name type: {}", name_type)
+                    format!("Unsupported name type: {}", name_type),
                 ));
             }
-            
+
             // Get the host name length (2 bytes)
             let host_name_len = bytes.get_u16().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Invalid host name length"
-                )
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid host name length")
             })?;
-            
+
             // Get the host name bytes
             let host_name = bytes.get_bytes(host_name_len as usize);
             if host_name.len() != host_name_len as usize {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "Insufficient host name data"
+                    "Insufficient host name data",
                 ));
             }
-            
+
             // Add the server name to the list
             server_name_list.push(ServerName {
                 name_type: NameType::HostName,
                 host_name,
             });
-            
+
             // Update remaining bytes counter
             // 1 byte for name_type + 2 bytes for host_name_len + host_name_len bytes
             remaining = remaining.saturating_sub(3 + host_name_len as usize);
         }
-        
+
         // Ensure we consumed exactly the amount specified by list_len
         if remaining > 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Malformed server name list data"
+                "Malformed server name list data",
             ));
         }
-        
-        debug!("Parsed ServerNameList with {} entries", server_name_list.len());
-        
-        Ok(Box::new(ServerNameList {
-            server_name_list,
-        }))
+
+        debug!(
+            "Parsed ServerNameList with {} entries",
+            server_name_list.len()
+        );
+
+        Ok(Box::new(ServerNameList { server_name_list }))
     }
 }
 
@@ -449,8 +459,29 @@ impl ByteSerializable for SignatureScheme {
         }
     }
 
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement SignatureScheme from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        match bytes.get_u16().ok_or_else(ByteParser::insufficient_data)? {
+            0x0401 => Ok(Box::new(SignatureScheme::RsaPkcs1Sha256)),
+            0x0501 => Ok(Box::new(SignatureScheme::RsaPkcs1Sha384)),
+            0x0601 => Ok(Box::new(SignatureScheme::RsaPkcs1Sha512)),
+            0x0403 => Ok(Box::new(SignatureScheme::EcdsaSecp256r1Sha256)),
+            0x0503 => Ok(Box::new(SignatureScheme::EcdsaSecp384r1Sha384)),
+            0x0603 => Ok(Box::new(SignatureScheme::EcdsaSecp521r1Sha512)),
+            0x0804 => Ok(Box::new(SignatureScheme::RsaPssRsaeSha256)),
+            0x0805 => Ok(Box::new(SignatureScheme::RsaPssRsaeSha384)),
+            0x0806 => Ok(Box::new(SignatureScheme::RsaPssRsaeSha512)),
+            0x0807 => Ok(Box::new(SignatureScheme::Ed25519)),
+            0x0808 => Ok(Box::new(SignatureScheme::Ed448)),
+            0x0809 => Ok(Box::new(SignatureScheme::RsaPssPssSha256)),
+            0x080a => Ok(Box::new(SignatureScheme::RsaPssPssSha384)),
+            0x080b => Ok(Box::new(SignatureScheme::RsaPssPssSha512)),
+            0x0201 => Ok(Box::new(SignatureScheme::RsaPkcs1Sha1)),
+            0x0203 => Ok(Box::new(SignatureScheme::EcdsaSha1)),
+            value => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid SignatureScheme value: 0x{:04x}", value),
+            )),
+        }
     }
 }
 #[derive(Debug, Clone)]
@@ -468,8 +499,52 @@ impl ByteSerializable for SupportedSignatureAlgorithms {
         Some(bytes)
     }
 
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement SupportedSignatureAlgorithms from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        // First get the total length of the supported signature algorithms list
+        let list_len = bytes.get_u16().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid supported signature algorithms list length",
+            )
+        })?;
+
+        // Make sure the list length is valid (at least one algorithm, and even number of bytes)
+        if list_len == 0 || list_len % 2 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid supported signature algorithms list length: {}",
+                    list_len
+                ),
+            ));
+        }
+
+        let mut supported_signature_algorithms = Vec::new();
+        let mut remaining = list_len as usize;
+
+        // Each signature scheme is 2 bytes
+        while remaining >= 2 && !bytes.is_empty() {
+            let signature_scheme = *SignatureScheme::from_bytes(bytes)?;
+            supported_signature_algorithms.push(signature_scheme);
+            remaining -= 2;
+        }
+
+        // Make sure we consumed exactly the amount of bytes specified by list_len
+        if remaining > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed supported signature algorithms list data",
+            ));
+        }
+
+        debug!(
+            "Parsed SupportedSignatureAlgorithms with {} algorithms",
+            supported_signature_algorithms.len()
+        );
+
+        Ok(Box::new(SupportedSignatureAlgorithms {
+            supported_signature_algorithms,
+        }))
     }
 }
 
@@ -553,31 +628,29 @@ impl ByteSerializable for NamedGroupList {
         let list_len = _bytes.get_u16().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Invalid named group list length"
+                "Invalid named group list length",
             )
         })?;
-        
+
         let mut named_group_list = Vec::new();
         let mut remaining = list_len as usize;
-        
+
         // Each named group is 2 bytes
         while remaining >= 2 && !_bytes.is_empty() {
             let group = *NamedGroup::from_bytes(_bytes)?;
             named_group_list.push(group);
             remaining -= 2;
         }
-        
+
         // Make sure we consumed exactly the amount of bytes specified by list_len
         if remaining > 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Malformed named group list data"
+                "Malformed named group list data",
             ));
         }
-        
-        Ok(Box::new(NamedGroupList {
-            named_group_list,
-        }))
+
+        Ok(Box::new(NamedGroupList { named_group_list }))
     }
 }
 
@@ -605,24 +678,24 @@ impl ByteSerializable for KeyShareEntry {
     fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
         // First parse the named group
         let group = *NamedGroup::from_bytes(bytes)?;
-        
+
         // Then get the length of the key exchange data
         let key_exchange_len = bytes.get_u16().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Invalid key exchange length"
+                "Invalid key exchange length",
             )
         })?;
-        
+
         // Extract the key exchange data
         let key_exchange = bytes.get_bytes(key_exchange_len as usize);
         if key_exchange.len() != key_exchange_len as usize {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Insufficient key exchange data"
+                "Insufficient key exchange data",
             ));
         }
-        
+
         Ok(Box::new(KeyShareEntry {
             group,
             key_exchange,
@@ -656,8 +729,53 @@ impl ByteSerializable for KeyShareClientHello {
         Some(bytes)
     }
 
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement KeyShareClientHello from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        // First get the total length of the client shares
+        let list_len = bytes.get_u16().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid key share client hello length",
+            )
+        })?;
+
+        let mut client_shares = Vec::new();
+        let mut remaining = list_len as usize;
+
+        // Parse each key share entry until we've consumed the entire list
+        while remaining > 0 && !bytes.is_empty() {
+            // Create a marker to track how many bytes we consume
+            let start_pos = bytes.len();
+
+            // Parse a key share entry
+            let entry = *KeyShareEntry::from_bytes(bytes)?;
+
+            // Calculate how many bytes were consumed
+            let bytes_consumed = start_pos - bytes.len();
+            if bytes_consumed > remaining {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Malformed key share entry data",
+                ));
+            }
+
+            client_shares.push(entry);
+            remaining -= bytes_consumed;
+        }
+
+        // Make sure we consumed exactly the amount of bytes specified by list_len
+        if remaining > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed key share client hello data",
+            ));
+        }
+
+        debug!(
+            "Parsed KeyShareClientHello with {} entries",
+            client_shares.len()
+        );
+
+        Ok(Box::new(KeyShareClientHello { client_shares }))
     }
 }
 /// `key_share` extension data structure in `ServerHello`
@@ -712,8 +830,53 @@ impl ByteSerializable for PskKeyExchangeModes {
         Some(bytes)
     }
 
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement PskKeyExchangeModes from_bytes")
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        // First get the length of the modes list
+        let list_len = bytes.get_u8().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid PSK key exchange modes list length",
+            )
+        })?;
+
+        let mut ke_modes = Vec::new();
+        let mut remaining = list_len as usize;
+
+        // Each mode is 1 byte
+        while remaining > 0 && !bytes.is_empty() {
+            let mode = bytes.get_u8().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Insufficient data for PSK key exchange mode",
+                )
+            })?;
+
+            // Validate the mode value
+            match mode {
+                0 => ke_modes.push(PskKeyExchangeMode::PskKe),
+                1 => ke_modes.push(PskKeyExchangeMode::PskDheKe),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Invalid PSK key exchange mode: {}", mode),
+                    ))
+                }
+            }
+
+            remaining -= 1;
+        }
+
+        // Make sure we consumed exactly the amount of bytes specified by list_len
+        if remaining > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed PSK key exchange modes list data",
+            ));
+        }
+
+        debug!("Parsed PskKeyExchangeModes with {} modes", ke_modes.len());
+
+        Ok(Box::new(PskKeyExchangeModes { ke_modes }))
     }
 }
 
@@ -739,7 +902,22 @@ mod tests {
                 0x6c, 0x66, 0x68, 0x65, 0x69, 0x6d, 0x2e, 0x6e, 0x65, 0x74
             ]
         );
+
+        // Test the from_bytes implementation
+        let mut parser = ByteParser::from(bytes.clone());
+        let parsed = *ServerNameList::from_bytes(&mut parser).unwrap();
+
+        assert_eq!(parsed.server_name_list.len(), 1);
+        assert_eq!(
+            parsed.server_name_list[0].name_type as u8,
+            NameType::HostName as u8
+        );
+        assert_eq!(
+            parsed.server_name_list[0].host_name,
+            "example.ulfheim.net".as_bytes().to_vec()
+        );
     }
+
     #[test]
     fn test_extension_server_name_list() {
         let extension = Extension {
@@ -760,5 +938,351 @@ mod tests {
                 0x6c, 0x65, 0x2e, 0x75, 0x6c, 0x66, 0x68, 0x65, 0x69, 0x6d, 0x2e, 0x6e, 0x65, 0x74
             ]
         );
+    }
+
+    #[test]
+    fn test_supported_versions() {
+        // Test the client format (suggested versions)
+        let client_versions = SupportedVersions {
+            version: VersionKind::Suggested(vec![0x0304, 0x0303]),
+        };
+        let bytes = client_versions.as_bytes().unwrap();
+        assert_eq!(bytes.len(), 5);
+        assert_eq!(bytes, vec![0x04, 0x03, 0x04, 0x03, 0x03]); // Length + TLS 1.3 + TLS 1.2
+
+        // Test the server format (selected version)
+        let server_version = SupportedVersions {
+            version: VersionKind::Selected(0x0304),
+        };
+        let bytes = server_version.as_bytes().unwrap();
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(bytes, vec![0x03, 0x04]); // TLS 1.3
+
+        // Test parsing server format
+        let mut parser = ByteParser::from(vec![0x03, 0x04]);
+        let parsed = *SupportedVersions::from_bytes(&mut parser).unwrap();
+        match parsed.version {
+            VersionKind::Selected(version) => assert_eq!(version, 0x0304),
+            _ => panic!("Expected VersionKind::Selected"),
+        }
+    }
+
+    #[test]
+    fn test_named_group() {
+        // Test serialization
+        assert_eq!(NamedGroup::X25519.as_bytes().unwrap(), vec![0x00, 0x1D]);
+        assert_eq!(NamedGroup::Secp256r1.as_bytes().unwrap(), vec![0x00, 0x17]);
+
+        // Test deserialization
+        let mut parser = ByteParser::from(vec![0x00, 0x1D]);
+        let parsed = *NamedGroup::from_bytes(&mut parser).unwrap();
+        assert!(matches!(parsed, NamedGroup::X25519));
+
+        let mut parser = ByteParser::from(vec![0x00, 0x17]);
+        let parsed = *NamedGroup::from_bytes(&mut parser).unwrap();
+        assert!(matches!(parsed, NamedGroup::Secp256r1));
+    }
+
+    #[test]
+    fn test_named_group_list() {
+        let named_group_list = NamedGroupList {
+            named_group_list: vec![NamedGroup::X25519, NamedGroup::Secp256r1],
+        };
+        let bytes = named_group_list.as_bytes().unwrap();
+        assert_eq!(bytes.len(), 6); // 2 bytes for length + 2 bytes per group
+        assert_eq!(bytes, vec![0x00, 0x04, 0x00, 0x1D, 0x00, 0x17]);
+
+        // Test deserialization
+        let mut parser = ByteParser::from(bytes);
+        let parsed = *NamedGroupList::from_bytes(&mut parser).unwrap();
+
+        assert_eq!(parsed.named_group_list.len(), 2);
+        assert!(matches!(parsed.named_group_list[0], NamedGroup::X25519));
+        assert!(matches!(parsed.named_group_list[1], NamedGroup::Secp256r1));
+    }
+
+    #[test]
+    fn test_key_share_entry() {
+        // Create test data
+        let key_share_entry = KeyShareEntry {
+            group: NamedGroup::X25519,
+            key_exchange: vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 28, 29, 30, 31, 32,
+            ],
+        };
+
+        // Test serialization
+        let bytes = key_share_entry.as_bytes().unwrap();
+        assert_eq!(
+            bytes,
+            vec![
+                0x00, 0x1D, // X25519
+                0x00, 0x20, // length 32
+                // key exchange data - 32 bytes
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+                0x1D, 0x1E, 0x1F, 0x20
+            ]
+        );
+
+        // Test deserialization
+        let mut parser = ByteParser::from(bytes);
+        let parsed = *KeyShareEntry::from_bytes(&mut parser).unwrap();
+
+        assert!(matches!(parsed.group, NamedGroup::X25519));
+        assert_eq!(parsed.key_exchange.len(), 32);
+        assert_eq!(parsed.key_exchange, key_share_entry.key_exchange);
+    }
+
+    #[test]
+    fn test_key_share_server_hello() {
+        // Create a test key share
+        let key_share = KeyShareServerHello {
+            server_share: KeyShareEntry {
+                group: NamedGroup::X25519,
+                key_exchange: vec![
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                    23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                ],
+            },
+        };
+
+        // Serialize
+        let bytes = key_share.as_bytes().unwrap();
+
+        // Test serialization
+        assert_eq!(
+            bytes,
+            vec![
+                0x00, 0x1D, // X25519
+                0x00, 0x20, // length 32
+                // key exchange data - 32 bytes
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+                0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+                0x1D, 0x1E, 0x1F, 0x20
+            ]
+        );
+
+        // Test deserialization
+        let mut parser = ByteParser::from(bytes);
+        let parsed = *KeyShareServerHello::from_bytes(&mut parser).unwrap();
+
+        assert!(matches!(parsed.server_share.group, NamedGroup::X25519));
+        assert_eq!(parsed.server_share.key_exchange.len(), 32);
+        assert_eq!(
+            parsed.server_share.key_exchange,
+            key_share.server_share.key_exchange
+        );
+    }
+
+    #[test]
+    fn test_key_share_client_hello() {
+        // Create a test key share
+        let key_share = KeyShareClientHello {
+            client_shares: vec![
+                KeyShareEntry {
+                    group: NamedGroup::X25519,
+                    key_exchange: vec![
+                        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                        22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+                    ],
+                },
+                KeyShareEntry {
+                    group: NamedGroup::Secp256r1,
+                    key_exchange: vec![5, 5, 5, 5, 5, 5, 5, 5],
+                },
+            ],
+        };
+
+        // Serialize
+        let bytes = key_share.as_bytes().unwrap();
+
+        // Test serialization - should have length prefix followed by entries
+        assert_eq!(bytes.len(), 2 + 36 + 12); // 2 bytes length + 36 bytes X25519 entry + 12 bytes Secp256r1 entry
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 48); // Total length 48 bytes
+        assert_eq!(bytes[2], 0x00);
+        assert_eq!(bytes[3], 0x1D); // X25519
+
+        // Test deserialization - create mock data that would be returned by from_bytes
+        let test_bytes = vec![
+            0x00, 0x30, // length 48 bytes
+            // First entry - X25519
+            0x00, 0x1D, // X25519
+            0x00, 0x20, // length 32
+            // 32 bytes of key data
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+            0x1D, 0x1E, 0x1F, 0x20, // Second entry - Secp256r1
+            0x00, 0x17, // Secp256r1
+            0x00, 0x08, // length 8
+            0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, 0x05, // key data
+        ];
+
+        // This mocks what the function would do when implemented
+        let mut parser = ByteParser::from(test_bytes);
+        let parsed = *KeyShareClientHello::from_bytes(&mut parser).unwrap();
+
+        assert_eq!(parsed.client_shares.len(), 2);
+        assert!(matches!(parsed.client_shares[0].group, NamedGroup::X25519));
+        assert_eq!(parsed.client_shares[0].key_exchange.len(), 32);
+        assert!(matches!(
+            parsed.client_shares[1].group,
+            NamedGroup::Secp256r1
+        ));
+        assert_eq!(parsed.client_shares[1].key_exchange.len(), 8);
+    }
+
+    #[test]
+    fn test_signature_scheme() {
+        // Test serialization
+        assert_eq!(
+            SignatureScheme::Ed25519.as_bytes().unwrap(),
+            vec![0x08, 0x07]
+        );
+        assert_eq!(
+            SignatureScheme::RsaPkcs1Sha256.as_bytes().unwrap(),
+            vec![0x04, 0x01]
+        );
+
+        // Test deserialization with mock data
+        let test_bytes = vec![0x08, 0x07]; // Ed25519
+        let mut parser = ByteParser::from(test_bytes);
+        let parsed = *SignatureScheme::from_bytes(&mut parser).unwrap();
+        assert!(matches!(parsed, SignatureScheme::Ed25519));
+
+        let test_bytes = vec![0x04, 0x01]; // RsaPkcs1Sha256
+        let mut parser = ByteParser::from(test_bytes);
+        let parsed = *SignatureScheme::from_bytes(&mut parser).unwrap();
+        assert!(matches!(parsed, SignatureScheme::RsaPkcs1Sha256));
+
+        // Test invalid value handling
+        let test_bytes = vec![0xFF, 0xFF]; // Invalid value
+        let mut parser = ByteParser::from(test_bytes);
+        let result = SignatureScheme::from_bytes(&mut parser);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_supported_signature_algorithms() {
+        // Create test data
+        let supported_sig_algs = SupportedSignatureAlgorithms {
+            supported_signature_algorithms: vec![
+                SignatureScheme::Ed25519,
+                SignatureScheme::EcdsaSecp256r1Sha256,
+            ],
+        };
+
+        // Test serialization
+        let bytes = supported_sig_algs.as_bytes().unwrap();
+        assert_eq!(
+            bytes,
+            vec![
+                0x00, 0x04, // length 4 bytes
+                0x08, 0x07, // Ed25519
+                0x04, 0x03 // EcdsaSecp256r1Sha256
+            ]
+        );
+
+        // Test deserialization with mock data
+        let test_bytes = vec![
+            0x00, 0x04, // length 4 bytes
+            0x08, 0x07, // Ed25519
+            0x04, 0x03, // EcdsaSecp256r1Sha256
+        ];
+
+        let mut parser = ByteParser::from(test_bytes);
+        let parsed = *SupportedSignatureAlgorithms::from_bytes(&mut parser).unwrap();
+
+        assert_eq!(parsed.supported_signature_algorithms.len(), 2);
+        assert!(matches!(
+            parsed.supported_signature_algorithms[0],
+            SignatureScheme::Ed25519
+        ));
+        assert!(matches!(
+            parsed.supported_signature_algorithms[1],
+            SignatureScheme::EcdsaSecp256r1Sha256
+        ));
+
+        // Test invalid length
+        let test_bytes = vec![
+            0x00, 0x04, // length 4 bytes
+            0x08, 0x07, // Only one algorithm when two are expected
+        ];
+
+        let mut parser = ByteParser::from(test_bytes);
+        let result = SupportedSignatureAlgorithms::from_bytes(&mut parser);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_psk_key_exchange_modes() {
+        // Create test data
+        let psk_modes = PskKeyExchangeModes {
+            ke_modes: vec![PskKeyExchangeMode::PskDheKe, PskKeyExchangeMode::PskKe],
+        };
+
+        // Test serialization
+        let bytes = psk_modes.as_bytes().unwrap();
+        assert_eq!(
+            bytes,
+            vec![
+                0x02, // length 2 bytes
+                0x01, // PskDheKe
+                0x00  // PskKe
+            ]
+        );
+
+        // Test deserialization
+        let test_bytes = vec![
+            0x02, // length 2 bytes
+            0x01, // PskDheKe
+            0x00, // PskKe
+        ];
+
+        let mut parser = ByteParser::from(test_bytes);
+        let parsed = *PskKeyExchangeModes::from_bytes(&mut parser).unwrap();
+
+        assert_eq!(parsed.ke_modes.len(), 2);
+        assert!(matches!(parsed.ke_modes[0], PskKeyExchangeMode::PskDheKe));
+        assert!(matches!(parsed.ke_modes[1], PskKeyExchangeMode::PskKe));
+
+        // Test invalid mode value
+        let test_bytes = vec![
+            0x01, // length 1 byte
+            0x02, // Invalid mode
+        ];
+
+        let mut parser = ByteParser::from(test_bytes);
+        let result = PskKeyExchangeModes::from_bytes(&mut parser);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore = "Client hello format parsing not yet implemented"]
+    fn test_supported_versions_client_hello() {
+        // Test the client format (suggested versions)
+        let client_versions = SupportedVersions {
+            version: VersionKind::Suggested(vec![0x0304, 0x0303]),
+        };
+        let bytes = client_versions.as_bytes().unwrap();
+        assert_eq!(bytes.len(), 5);
+        assert_eq!(bytes, vec![0x04, 0x03, 0x04, 0x03, 0x03]); // Length + TLS 1.3 + TLS 1.2
+
+        // Test parsing client format
+        let test_bytes = vec![0x04, 0x03, 0x04, 0x03, 0x03]; // Length + TLS 1.3 + TLS 1.2
+        let mut parser = ByteParser::from(test_bytes);
+
+        let parsed = *SupportedVersions::from_bytes(&mut parser).unwrap();
+
+        match parsed.version {
+            VersionKind::Suggested(versions) => {
+                assert_eq!(versions.len(), 2);
+                assert_eq!(versions[0], 0x0304); // TLS 1.3
+                assert_eq!(versions[1], 0x0303); // TLS 1.2
+            }
+            _ => panic!("Expected VersionKind::Suggested"),
+        }
     }
 }
