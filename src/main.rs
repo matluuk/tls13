@@ -229,7 +229,7 @@ fn main() {
         std::process::exit(1);
     };
     // Create initial random values and keys for the handshake
-    let handshake_keys = HandshakeKeys::new();
+    let mut handshake_keys = HandshakeKeys::new();
 
     match TcpStream::connect(address) {
         Ok(mut stream) => {
@@ -350,16 +350,66 @@ fn main() {
                     },
                     ContentType::Handshake => {
                         debug!("Raw handshake data: {:?}", record.fragment);
-                        let handshake = *Handshake::from_bytes(&mut record.fragment.into())
+                        // Using clone as the record.fragment is needed later
+                        let handshake = *Handshake::from_bytes(&mut record.fragment.clone().into())
                             .expect("Failed to parse Handshake message");
                         debug!("Handshake message: {:?}", &handshake);
                         if let HandshakeMessage::ServerHello(server_hello) = handshake.message {
-                            info!("ServerHello message: {:?}", server_hello);
-                            warn!("TODO: Implement the server hello message processing, and decoding of the rest of the extensions");
-                            // TODO find the key share entry for X25519
-                            // Calculate the shared secret (Check X25519_dalek crate)
-                            // Store the shared secret in the HandshakeKeys struct, and calculate the key schedule
-                            // TODO calculate transcript hash for hello messages (check illustration site and standard)
+                            info!("ServerHello message received");
+                            
+                            // Extract the KeyShare extension from ServerHello
+                            let mut server_key_share = None;
+                            for extension in &server_hello.extensions {
+                                if let ExtensionType::KeyShare = extension.extension_type {
+                                    if let ExtensionData::KeyShareServerHello(key_share) = &extension.extension_data {
+                                        if let NamedGroup::X25519 = key_share.server_share.group {
+                                            // Found the X25519 key share from server
+                                            server_key_share = Some(&key_share.server_share.key_exchange);
+                                            info!("Found server's X25519 key share: {}", to_hex(server_key_share.unwrap()));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Early return if no compatible key share found
+                            let server_key_bytes = match server_key_share {
+                                Some(key_bytes) => {
+                                    info!("Found server's X25519 key share: {}", to_hex(key_bytes));
+                                    key_bytes
+                                },
+                                None => {
+                                    error!("Server did not provide an X25519 key share, cannot proceed with handshake");
+                                    std::process::exit(1);
+                                }
+                            };
+                            
+                            // Convert server's key exchange bytes to PublicKey and store in handshake_keys
+                            let server_public_bytes: [u8; 32] = server_key_bytes.clone().try_into()
+                                .expect("Server's public key must be exactly 32 bytes for X25519");
+                            handshake_keys.dh_server_public = PublicKey::from(server_public_bytes);
+                            
+                            // Create transcript hash from ClientHello and ServerHello
+                            let mut transcript_data = Vec::new();
+                            transcript_data.extend_from_slice(&client_handshake_bytes); // Our ClientHello
+                            transcript_data.extend_from_slice(&record.fragment); // The ServerHello we received
+                            
+                            let transcript_hash = Sha256::digest(&transcript_data);
+                            info!("Transcript hash: {}", to_hex(&transcript_hash));
+                            
+                            // The key_schedule method will:
+                            // 1. Calculate the shared secret using Diffie-Hellman
+                            // 2. Derive handshake secrets using the transcript hash
+                            // 3. Generate keys and IVs for encryption/decryption
+                            handshake_keys.key_schedule(&transcript_hash);
+                            
+                            info!("Handshake keys derived successfully");
+                            // Now we have the keys needed to decrypt the following encrypted messages
+                            
+                            // Next steps:
+                            // 1. Implement decryption of the encrypted handshake messages
+                            // 2. Process EncryptedExtensions, Certificate, CertificateVerify, and Finished messages
+                            // 3. Send client Finished message to complete the handshake
                         }
                     }
                     ContentType::ApplicationData => {
