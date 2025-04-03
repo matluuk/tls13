@@ -61,7 +61,24 @@ impl Extension {
         debug!("Extension data: {:?}", ext_bytes);
         let extension_data = match ext_type {
             // TODO Implement the rest of the extension types
-            0 => ExtensionData::ServerName(*ServerNameList::from_bytes(&mut ext_bytes)?),
+            0 => {
+                if origin == ExtensionOrigin::Server {
+                    // For server-side SNI, the extension data must be empty
+                    if ext_data_len != 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Server SNI extension must have empty data",
+                        ));
+                    }
+                    debug!("Parsed empty Server Name Indication (SNI) extension");
+                    ExtensionData::ServerName(ServerNameList {
+                        server_name_list: Vec::new(),
+                    })
+                } else {
+                    // Parse client-side SNI normally
+                    ExtensionData::ServerName(*ServerNameList::from_bytes(&mut ext_bytes)?)
+                }
+            },
             10 => {
                 // SupportedGroups extension
                 debug!("Parsing SupportedGroups extension");
@@ -350,6 +367,7 @@ impl ByteSerializable for ServerNameList {
         );
         Some(bytes)
     }
+
     fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
         // First get the total length of the list
         let list_len = bytes.get_u16().ok_or_else(|| {

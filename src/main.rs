@@ -17,13 +17,14 @@ use tls13tutorial::handshake::{
     cipher_suites, ClientHello, Handshake, HandshakeMessage, HandshakeType, Random,
     TLS_VERSION_1_3, TLS_VERSION_COMPATIBILITY,
 };
+use tls13tutorial::parser::ByteParser;
 use tls13tutorial::tls_record::{ContentType, TLSRecord};
 
 // Cryptographic libraries
-// use chacha20poly1305::{
-//     aead::{Aead, KeyInit, Payload},
-//     ChaCha20Poly1305,
-// };
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    ChaCha20Poly1305,
+};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
@@ -177,6 +178,138 @@ impl HandshakeKeys {
         hk.expand(&hkdf_label, &mut okm)
             .expect("Failed to expand the secret");
         okm
+    }
+
+    /// Decrypt TLS 1.3 handshake records encrypted with ChaCha20-Poly1305
+    ///
+    /// According to RFC 8446, the nonce is formed by XORing the sequence number with the IV.
+    /// The sequence counter is incremented after each record is processed.
+    fn decrypt_server_handshake(
+        &mut self,
+        encrypted_data: &[u8],
+        record_type: ContentType,
+        record_version: u16,
+        record_length: u16,
+    ) -> Result<Vec<u8>, String> {
+        // ChaCha20-Poly1305 authentication tag is 16 bytes
+        if encrypted_data.len() < 16 {
+            return Err("Encrypted data is too short for ChaCha20-Poly1305".to_string());
+        }
+
+        // Split the data into ciphertext and auth tag
+        let ciphertext = &encrypted_data[..encrypted_data.len() - 16];
+        let auth_tag = &encrypted_data[encrypted_data.len() - 16..];
+
+        debug!("Ciphertext length: {}", ciphertext.len());
+        debug!("Auth tag: {}", to_hex(auth_tag));
+
+        // Initialize the ChaCha20-Poly1305 cipher with the server handshake key
+        let cipher = match ChaCha20Poly1305::new_from_slice(&self.server_hs_key) {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Failed to create ChaCha20Poly1305 cipher: {}", e)),
+        };
+
+        // Create the nonce by XORing the IV with the sequence number
+        // Per TLS 1.3 spec: the 64-bit record sequence number is encoded as an 8-byte big-endian value
+        // and padded on the left with zeros to iv_length.
+        let mut nonce = [0u8; 12]; // ChaCha20-Poly1305 uses 12-byte nonces
+        let seq_bytes = self.server_seq_num.to_be_bytes();
+
+        // Copy the IV first
+        nonce.copy_from_slice(&self.server_hs_iv);
+
+        // XOR the last 8 bytes with the sequence number
+        for i in 4..12 {
+            nonce[i] ^= seq_bytes[i - 4];
+        }
+
+        debug!("Using server_hs_key: {}", to_hex(&self.server_hs_key));
+        debug!("Using server_hs_iv: {}", to_hex(&self.server_hs_iv));
+        debug!("Sequence number: {}", self.server_seq_num);
+        debug!("Nonce: {}", to_hex(&nonce));
+
+        // In TLS 1.3, the additional authenticated data (AAD) is the TLS record header (5 bytes)
+        let mut aad = vec![record_type as u8];
+        aad.extend_from_slice(&record_version.to_be_bytes());
+        aad.extend_from_slice(&record_length.to_be_bytes());
+        debug!("AAD: {}", to_hex(&aad));
+
+        // Combine ciphertext and auth tag for most AEAD libraries
+        let mut ciphertext_with_tag = ciphertext.to_vec();
+        ciphertext_with_tag.extend_from_slice(auth_tag);
+
+        // Decrypt the message
+        let plaintext = match cipher.decrypt(
+            &nonce.into(),
+            Payload {
+                msg: &ciphertext_with_tag,
+                aad: &aad,
+            },
+        ) {
+            Ok(pt) => pt,
+            Err(e) => return Err(format!("Decryption failed: {}", e)),
+        };
+
+        // Increment the sequence number for next message
+        self.server_seq_num += 1;
+
+        debug!(
+            "Decryption successful, plaintext length: {}",
+            plaintext.len()
+        );
+
+        Ok(plaintext)
+    }
+
+    /// Encrypt data using client handshake keys with ChaCha20-Poly1305
+    fn encrypt_client_handshake(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        // Initialize the ChaCha20-Poly1305 cipher with the client handshake key
+        let cipher = match ChaCha20Poly1305::new_from_slice(&self.client_hs_key) {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Failed to create ChaCha20Poly1305 cipher: {}", e)),
+        };
+
+        // Create the nonce by XORing the IV with the sequence number
+        let mut nonce = [0u8; 12]; // ChaCha20-Poly1305 uses 12-byte nonces
+        let seq_bytes = self.client_seq_num.to_be_bytes();
+
+        // Copy the IV first
+        nonce.copy_from_slice(&self.client_hs_iv);
+
+        // XOR the last 8 bytes with the sequence number
+        for i in 4..12 {
+            nonce[i] ^= seq_bytes[i - 4];
+        }
+
+        debug!("Using client_hs_key: {}", to_hex(&self.client_hs_key));
+        debug!("Using client_hs_iv: {}", to_hex(&self.client_hs_iv));
+        debug!("Sequence number: {}", self.client_seq_num);
+        debug!("Nonce: {}", to_hex(&nonce));
+
+        // In TLS 1.3, the additional authenticated data (AAD) is empty for the record protection
+        let aad = b"";
+
+        // Encrypt the message
+        let ciphertext = match cipher.encrypt(
+            &nonce.into(),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        ) {
+            Ok(ct) => ct,
+            Err(e) => return Err(format!("Encryption failed: {}", e)),
+        };
+
+        // Increment the sequence number for next message
+        self.client_seq_num += 1;
+
+        debug!(
+            "Encryption successful, ciphertext length: {}",
+            ciphertext.len()
+        );
+
+        Ok(ciphertext)
     }
 }
 
@@ -356,56 +489,68 @@ fn main() {
                         debug!("Handshake message: {:?}", &handshake);
                         if let HandshakeMessage::ServerHello(server_hello) = handshake.message {
                             info!("ServerHello message received");
-                            
+
                             // Extract the KeyShare extension from ServerHello
                             let mut server_key_share = None;
                             for extension in &server_hello.extensions {
                                 if let ExtensionType::KeyShare = extension.extension_type {
-                                    if let ExtensionData::KeyShareServerHello(key_share) = &extension.extension_data {
+                                    if let ExtensionData::KeyShareServerHello(key_share) =
+                                        &extension.extension_data
+                                    {
                                         if let NamedGroup::X25519 = key_share.server_share.group {
                                             // Found the X25519 key share from server
-                                            server_key_share = Some(&key_share.server_share.key_exchange);
-                                            info!("Found server's X25519 key share: {}", to_hex(server_key_share.unwrap()));
+                                            server_key_share =
+                                                Some(&key_share.server_share.key_exchange);
+                                            info!(
+                                                "Found server's X25519 key share: {}",
+                                                to_hex(server_key_share.unwrap())
+                                            );
                                             break;
                                         }
                                     }
                                 }
                             }
-                            
+
                             // Early return if no compatible key share found
                             let server_key_bytes = match server_key_share {
                                 Some(key_bytes) => {
                                     info!("Found server's X25519 key share: {}", to_hex(key_bytes));
                                     key_bytes
-                                },
+                                }
                                 None => {
                                     error!("Server did not provide an X25519 key share, cannot proceed with handshake");
                                     std::process::exit(1);
                                 }
                             };
-                            
+
                             // Convert server's key exchange bytes to PublicKey and store in handshake_keys
-                            let server_public_bytes: [u8; 32] = server_key_bytes.clone().try_into()
+                            let server_public_bytes: [u8; 32] = server_key_bytes
+                                .clone()
+                                .try_into()
                                 .expect("Server's public key must be exactly 32 bytes for X25519");
                             handshake_keys.dh_server_public = PublicKey::from(server_public_bytes);
-                            
+
                             // Create transcript hash from ClientHello and ServerHello
                             let mut transcript_data = Vec::new();
                             transcript_data.extend_from_slice(&client_handshake_bytes); // Our ClientHello
                             transcript_data.extend_from_slice(&record.fragment); // The ServerHello we received
-                            
+
                             let transcript_hash = Sha256::digest(&transcript_data);
                             info!("Transcript hash: {}", to_hex(&transcript_hash));
-                            
+
                             // The key_schedule method will:
                             // 1. Calculate the shared secret using Diffie-Hellman
                             // 2. Derive handshake secrets using the transcript hash
                             // 3. Generate keys and IVs for encryption/decryption
                             handshake_keys.key_schedule(&transcript_hash);
-                            
+
+                            // Reset the sequence numbers when we start a new encrypted communication
+                            handshake_keys.server_seq_num = 0;
+                            handshake_keys.client_seq_num = 0;
+
                             info!("Handshake keys derived successfully");
                             // Now we have the keys needed to decrypt the following encrypted messages
-                            
+
                             // Next steps:
                             // 1. Implement decryption of the encrypted handshake messages
                             // 2. Process EncryptedExtensions, Certificate, CertificateVerify, and Finished messages
@@ -418,7 +563,99 @@ fn main() {
                         // Read TLSInnerPlaintext and proceed with the handshake
                         info!("Application data received, size of : {:?}", record.length);
                         assert_eq!(record.fragment.len(), record.length as usize);
-                        warn!("TODO: Decryption of the data and decoding of the all extensions not implemented");
+                        // todo: remove - warn!("TODO: Decryption of the data and decoding of the all extensions not implemented");
+
+                        // Try to decrypt the record
+                        match handshake_keys.decrypt_server_handshake(
+                            &record.fragment,
+                            record.record_type,
+                            record.legacy_record_version,
+                            record.length,
+                        ) {
+                            Ok(plaintext) => {
+                                // The last byte of the plaintext is the content type
+                                if plaintext.is_empty() {
+                                    error!("Decrypted record is empty");
+                                    continue;
+                                }
+
+                                // Debug: Print full plaintext in hex
+                                debug!("Raw decrypted data: {}", to_hex(&plaintext));
+
+                                // Get the content type (last byte) and remove any padding
+                                let content_type = plaintext[plaintext.len() - 1];
+
+                                // Find the actual content by removing zeroes (padding) from the end
+                                // and the content type byte
+                                let mut content_end = plaintext.len() - 1;
+                                while content_end > 0 && plaintext[content_end - 1] == 0 {
+                                    content_end -= 1;
+                                }
+
+                                let inner_content = &plaintext[..content_end];
+
+                                info!(
+                                    "Decrypted record: content type {} with {} bytes of data",
+                                    content_type,
+                                    inner_content.len()
+                                );
+
+                                // Handle the decrypted content based on its type
+                                match content_type {
+                                    // ContentType::Handshake value (22)
+                                    22 => {
+                                        // Parse multiple handshake messages from the decrypted data
+                                        let mut parser = ByteParser::from(inner_content.to_vec());
+                                        while !parser.is_empty() {
+                                            debug!("Parser remaining data: {} bytes", parser.len());
+                                            match Handshake::from_bytes(&mut parser) {
+                                                Ok(handshake) => {
+                                                    info!(
+                                                        "Decrypted handshake message: {:?}",
+                                                        handshake.msg_type
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to parse handshake message: {}", e);
+                                                    break; // Stop processing if there's an error
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // ContentType::Alert value (21)
+                                    21 => {
+                                        if inner_content.len() == 2 {
+                                            info!(
+                                                "Decrypted alert: level={}, description={}",
+                                                inner_content[0], inner_content[1]
+                                            );
+                                        } else {
+                                            error!("Invalid alert format");
+                                        }
+                                    }
+                                    // ContentType::ApplicationData value (23)
+                                    23 => {
+                                        info!(
+                                            "Decrypted application data: {} bytes",
+                                            inner_content.len()
+                                        );
+                                        // We shouldn't receive application data during handshake
+                                        warn!("Unexpected application data during handshake");
+                                    }
+                                    _ => {
+                                        warn!("Unknown content type: {}", content_type);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to decrypt record: {}", e);
+                            }
+                        }
+                    }
+                    ContentType::ChangeCipherSpec => {
+                        // TLS 1.3 allows but ignores ChangeCipherSpec records
+                        info!("Received ChangeCipherSpec message (ignored in TLS 1.3)");
+                        // Nothing to do - this is just for compatibility with middleboxes
                     }
                     _ => {
                         error!("Unexpected response type: {:?}", record.record_type);

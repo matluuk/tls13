@@ -1,5 +1,6 @@
 //! This module contains the structures and implementations for the handshake messages.
 #![allow(clippy::module_name_repetitions)]
+use log::{debug, error, info, warn};
 use crate::extensions::{ByteSerializable, Extension, ExtensionOrigin};
 use crate::handshake::cipher_suites::CipherSuite;
 use crate::parser::ByteParser;
@@ -75,7 +76,7 @@ pub enum HandshakeMessage {
     ClientHello(ClientHello),
     ServerHello(ServerHello),
     EndOfEarlyData,
-    EncryptedExtensions,
+    EncryptedExtensions(EncryptedExtensions),
     CertificateRequest,
     Certificate(Certificate),
     CertificateVerify,
@@ -105,6 +106,9 @@ impl ByteSerializable for Handshake {
             HandshakeMessage::ClientHello(client_hello) => {
                 bytes.extend_from_slice(&client_hello.as_bytes()?);
             }
+            HandshakeMessage::EncryptedExtensions(encrypted_extensions) => {
+                bytes.extend_from_slice(&encrypted_extensions.as_bytes()?);
+            }
             HandshakeMessage::Finished(finished) => {
                 bytes.extend_from_slice(&finished.as_bytes()?);
             }
@@ -114,11 +118,12 @@ impl ByteSerializable for Handshake {
     }
 
     /// Parse the bytes into a `Handshake` struct.
-    /// We only support `ServerHello`, `Certificate`, `CertificateVerify` and `Finished` messages.
+    /// We only support `ServerHello`, `Certificate`, `CertificateVerify`, `EncryptedExtensions` and `Finished` messages.
     fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
         let hs_type = match bytes.get_u8() {
             Some(1) => HandshakeType::ClientHello,
             Some(2) => HandshakeType::ServerHello,
+            Some(8) => HandshakeType::EncryptedExtensions,
             Some(11) => HandshakeType::Certificate,
             Some(15) => HandshakeType::CertificateVerify,
             Some(20) => HandshakeType::Finished,
@@ -143,6 +148,10 @@ impl ByteSerializable for Handshake {
             HandshakeType::ServerHello => {
                 let server_hello = ServerHello::from_bytes(bytes)?;
                 HandshakeMessage::ServerHello(*server_hello)
+            }
+            HandshakeType::EncryptedExtensions => {
+                let encrypted_extensions = EncryptedExtensions::from_bytes(bytes)?;
+                HandshakeMessage::EncryptedExtensions(*encrypted_extensions)
             }
             HandshakeType::Certificate => {
                 let certificate = Certificate::from_bytes(bytes)?;
@@ -373,9 +382,229 @@ pub struct Certificate {
 
 impl ByteSerializable for Certificate {
     fn as_bytes(&self) -> Option<Vec<u8>> {
-        todo!("Implement Certificate::as_bytes")
+        let mut bytes = Vec::new();
+
+        // Serialize the certificate_request_context
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.push(self.certificate_request_context.len() as u8);
+        bytes.extend_from_slice(&self.certificate_request_context);
+
+        // Serialize the certificate_list
+        let mut cert_list_bytes = Vec::new();
+        for cert_entry in &self.certificate_list {
+            // Serialize certificate_data length (3 bytes)
+            let cert_data_len = cert_entry.certificate_data.len();
+            cert_list_bytes.extend_from_slice(
+                &u32::try_from(cert_data_len)
+                    .ok()?
+                    .to_be_bytes()[1..], // Use only the last 3 bytes
+            );
+
+            // Serialize certificate_data
+            cert_list_bytes.extend_from_slice(&cert_entry.certificate_data);
+
+            // Serialize extensions length (2 bytes)
+            let mut ext_bytes = Vec::new();
+            for extension in &cert_entry.extensions {
+                ext_bytes.extend(extension.as_bytes()?);
+            }
+            cert_list_bytes.extend_from_slice(
+                &u16::try_from(ext_bytes.len())
+                    .ok()?
+                    .to_be_bytes(),
+            );
+
+            // Serialize extensions
+            cert_list_bytes.extend(ext_bytes);
+        }
+
+        // Add the certificate_list length (3 bytes)
+        bytes.extend_from_slice(
+            &u32::try_from(cert_list_bytes.len())
+                .ok()?
+                .to_be_bytes()[1..], // Use only the last 3 bytes
+        );
+
+        // Add the serialized certificate_list
+        bytes.extend(cert_list_bytes);
+
+        Some(bytes)
     }
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement Certificate::from_bytes")
+
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        // Parse the certificate_request_context length (1 byte)
+        let context_len = bytes.get_u8().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to read certificate_request_context length",
+            )
+        })?;
+        
+        // Parse the certificate_request_context
+        let certificate_request_context = bytes.get_bytes(context_len as usize);
+        if certificate_request_context.len() != context_len as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid certificate_request_context length",
+            ));
+        }
+
+        // Parse the certificate_list length (3 bytes)
+        let certificate_list_len = bytes.get_u24().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to read certificate_list length",
+            )
+        })?;
+
+        let mut certificate_list = Vec::new();
+        let mut remaining = certificate_list_len as usize;
+
+        // Parse each certificate entry
+        while remaining > 0 && !bytes.is_empty() {
+            // Parse the certificate_data length (3 bytes)
+            let cert_data_len = bytes.get_u24().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Failed to read certificate_data length",
+                )
+            })?;
+
+            // Parse the certificate_data
+            let certificate_data = bytes.get_bytes(cert_data_len as usize);
+            if certificate_data.len() != cert_data_len as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid certificate_data length",
+                ));
+            }
+
+            // Parse the extensions length (2 bytes)
+            let extensions_len = bytes.get_u16().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Failed to read certificate extensions length",
+                )
+            })?;
+
+            // Parse the extensions
+            let extension_bytes = bytes.get_bytes(extensions_len as usize);
+            if extension_bytes.len() != extensions_len as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid certificate extensions length",
+                ));
+            }
+
+            let mut ext_parser = ByteParser::from(extension_bytes);
+            let mut extensions = Vec::new();
+
+            while !ext_parser.is_empty() {
+                let extension = Extension::from_bytes(&mut ext_parser, ExtensionOrigin::Server)?;
+                extensions.push(*extension);
+            }
+
+            // Add the parsed certificate entry to the list
+            certificate_list.push(CertificateEntry {
+                certificate_type: CertificateType::X509, // Default to X509 for now
+                certificate_data,
+                extensions,
+            });
+
+            // Update the remaining bytes counter
+            remaining = remaining.saturating_sub(3 + cert_data_len as usize + 2 + extensions_len as usize);
+        }
+
+        // Ensure we consumed exactly the amount specified by certificate_list_len
+        if remaining > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed certificate list data",
+            ));
+        }
+
+        debug!(
+            "Parsed Certificate with {} entries",
+            certificate_list.len()
+        );
+
+        Ok(Box::new(Certificate {
+            certificate_request_context,
+            certificate_list,
+        }))
+    }
+}
+
+/// [`EncryptedExtensions` message](https://datatracker.ietf.org/doc/html/rfc8446#section-4.3.1)
+/// The EncryptedExtensions message contains extensions that can be protected.
+#[derive(Debug, Clone)]
+pub struct EncryptedExtensions {
+    pub extensions: Vec<Extension>, // length of the data can be 0..2^16-1 (2 bytes to present)
+}
+
+
+impl ByteSerializable for EncryptedExtensions {
+    fn as_bytes(&self) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut ext_bytes = Vec::new();
+        
+        for extension in &self.extensions {
+            ext_bytes.extend(extension.as_bytes()?);
+        }
+        
+        // 2-byte length prefix for all extensions
+        bytes.extend(u16::try_from(ext_bytes.len()).ok()?.to_be_bytes());
+        bytes.extend(ext_bytes);
+        
+        Some(bytes)
+    }
+    
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        // Debug print to show what we're parsing
+        debug!("Parsing EncryptedExtensions, bytes available: {}", bytes.len());
+        // if bytes.len() > 16 {
+        //     debug!("First 16 bytes: {}", to_hex(&bytes.get_bytes(0).drain(..).collect::<Vec<u8>>()[..16]));
+        // }
+        
+        // Get the total length of all extensions
+        let extensions_length = match bytes.get_u16() {
+            Some(len) => len,
+            None => return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to read EncryptedExtensions length"
+            )),
+        };
+        debug!("EncryptedExtensions: total extension length is {}", extensions_length);
+        
+        if extensions_length as usize > bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("EncryptedExtensions length ({}) exceeds available data ({})", 
+                      extensions_length, bytes.len())
+            ));
+        }
+        
+        // Extract all extension bytes
+        let extension_bytes = bytes.get_bytes(extensions_length as usize);
+        let mut ext_parser = ByteParser::from(extension_bytes);
+        let mut extensions = Vec::new();
+        
+        // Parse each extension
+        while !ext_parser.is_empty() {
+            match Extension::from_bytes(&mut ext_parser, ExtensionOrigin::Server) {
+                Ok(extension) => extensions.push(*extension),
+                Err(e) => {
+                    debug!("Failed to parse extension: {}", e);
+                    // debug!("Remaining bytes: {}", to_hex(&ext_parser.drain()));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Failed to parse extension in EncryptedExtensions: {}", e)
+                    ));
+                }
+            }
+        }
+        
+        debug!("Successfully parsed EncryptedExtensions with {} extensions", extensions.len());
+        Ok(Box::new(EncryptedExtensions { extensions }))
     }
 }
