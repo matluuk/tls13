@@ -76,6 +76,18 @@ impl ByteParser {
             "Insufficient data when parsing input bytes",
         )
     }
+
+    /// Get the remaining data in the deque as a Vec<u8>
+    #[must_use]
+    pub fn remaining_data(&self) -> Vec<u8> {
+        self.deque.iter().copied().collect()
+    }
+
+    /// Get the remaining data in the deque as a hexadecimal string
+    #[must_use]
+    pub fn remaining_data_hex(&self) -> String {
+        self.deque.iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<_>>().join(" ")
+    }
 }
 
 /// Allow initializing Parser from a vector of bytes
