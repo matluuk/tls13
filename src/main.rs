@@ -563,7 +563,6 @@ fn main() {
                         // Read TLSInnerPlaintext and proceed with the handshake
                         info!("Application data received, size of : {:?}", record.length);
                         assert_eq!(record.fragment.len(), record.length as usize);
-                        // todo: remove - warn!("TODO: Decryption of the data and decoding of the all extensions not implemented");
 
                         // Try to decrypt the record
                         match handshake_keys.decrypt_server_handshake(
@@ -582,17 +581,11 @@ fn main() {
                                 // Debug: Print full plaintext in hex
                                 debug!("Raw decrypted data: {}", to_hex(&plaintext));
 
-                                // Get the content type (last byte) and remove any padding
+                                // Extract the content type from the last byte
                                 let content_type = plaintext[plaintext.len() - 1];
 
-                                // Find the actual content by removing zeroes (padding) from the end
-                                // and the content type byte
-                                let mut content_end = plaintext.len() - 1;
-                                while content_end > 0 && plaintext[content_end - 1] == 0 {
-                                    content_end -= 1;
-                                }
-
-                                let inner_content = &plaintext[..content_end];
+                                // Slice the plaintext to exclude the last byte (content type)
+                                let inner_content = &plaintext[..plaintext.len() - 1];
 
                                 info!(
                                     "Decrypted record: content type {} with {} bytes of data",
