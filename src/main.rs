@@ -32,6 +32,7 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
+use hmac::{Hmac, Mac};
 
 const DEBUGGING_EPHEMERAL_SECRET: [u8; 32] = [
     0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10, 0x11,
@@ -40,6 +41,48 @@ const DEBUGGING_EPHEMERAL_SECRET: [u8; 32] = [
 
 /// Key calculation and resulting keys, includes initial random values for `ClientHello`
 /// Check section about [KeySchedule](https://datatracker.ietf.org/doc/html/rfc8446#section-7.1)
+
+
+/// Maintains the transcript hash state throughout the TLS 1.3 handshake
+struct TranscriptManager {
+    messages: Vec<Vec<u8>>,
+    current_hash: Vec<u8>,
+}
+
+impl TranscriptManager {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            current_hash: Vec::new(),
+        }
+    }
+
+    /// Add a new handshake message to the transcript and update the hash
+    fn update(&mut self, message: &[u8]) {
+        // Store the raw message
+        self.messages.push(message.to_vec());
+        
+        // Recalculate the hash with all messages so far
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        for msg in &self.messages {
+            hasher.update(msg);
+        }
+        self.current_hash = hasher.finalize().to_vec();
+        
+        debug!("Updated transcript hash: {}", to_hex(&self.current_hash));
+    }
+
+    /// Get the current transcript hash
+    fn get_current_hash(&self) -> &[u8] {
+        &self.current_hash
+    }
+
+    /// Get all stored handshake messages
+    fn get_messages(&self) -> &[Vec<u8>] {
+        &self.messages
+    }
+}
+
 struct HandshakeKeys {
     random_seed: Random,
     session_id: Random,
@@ -367,6 +410,10 @@ fn main() {
     };
     // Create initial random values and keys for the handshake
     let mut handshake_keys = HandshakeKeys::new();
+    
+    let mut transcript_manager = TranscriptManager::new();
+    let mut server_certificate: Option<tls13tutorial::handshake::Certificate> = None;
+    let mut handshake_complete = false;
 
     match TcpStream::connect(address) {
         Ok(mut stream) => {
@@ -445,6 +492,8 @@ fn main() {
             let client_handshake_bytes = handshake
                 .as_bytes()
                 .expect("Failed to serialize Handshake message into bytes");
+
+            transcript_manager.update(&client_handshake_bytes);
 
             let request_record = TLSRecord {
                 record_type: ContentType::Handshake,
@@ -534,19 +583,14 @@ fn main() {
                                 .expect("Server's public key must be exactly 32 bytes for X25519");
                             handshake_keys.dh_server_public = PublicKey::from(server_public_bytes);
 
-                            // Create transcript hash from ClientHello and ServerHello
-                            let mut transcript_data = Vec::new();
-                            transcript_data.extend_from_slice(&client_handshake_bytes); // Our ClientHello
-                            transcript_data.extend_from_slice(&record.fragment); // The ServerHello we received
-
-                            let transcript_hash = Sha256::digest(&transcript_data);
-                            info!("Transcript hash: {}", to_hex(&transcript_hash));
+                            transcript_manager.update(&record.fragment);
+                            info!("Transcript hash after ServerHello: {}", to_hex(transcript_manager.get_current_hash()));
 
                             // The key_schedule method will:
                             // 1. Calculate the shared secret using Diffie-Hellman
                             // 2. Derive handshake secrets using the transcript hash
                             // 3. Generate keys and IVs for encryption/decryption
-                            handshake_keys.key_schedule(&transcript_hash);
+                            handshake_keys.key_schedule(transcript_manager.get_current_hash());
 
                             // Reset the sequence numbers when we start a new encrypted communication
                             handshake_keys.server_seq_num = 0;
@@ -607,10 +651,17 @@ fn main() {
                                             debug!("Parser remaining data: {} bytes", parser.len());
                                             match Handshake::from_bytes(&mut parser) {
                                                 Ok(handshake) => {
-                                                    info!(
-                                                        "Decrypted handshake message: {:?}",
-                                                        handshake.msg_type
-                                                    );
+                                                    info!("Decrypted handshake message: {:?}", handshake.msg_type);
+        
+                                                    // Serialize the handshake message for the transcript
+                                                    let handshake_bytes = handshake
+                                                        .as_bytes()
+                                                        .expect("Failed to serialize handshake message");
+                                                        
+                                                    // Add to transcript (except for Finished messages)
+                                                    if handshake.msg_type != HandshakeType::Finished {
+                                                        transcript_manager.update(&handshake_bytes);
+                                                    }
 
                                                     // Handle different handshake message types
                                                     match handshake.msg_type {
@@ -618,8 +669,26 @@ fn main() {
                                                             info!("Processing Certificate message");
                                                             if let HandshakeMessage::Certificate(certificate) = handshake.message {
                                                                 debug!("Certificate: {:?}", certificate);
-                                                                certificate::process_certificate_message(&certificate)
+                                                                certificate::process_certificate_message(&certificate, hostname)
                                                                     .expect("Failed to process certificate");
+        
+                                                                // Save the certificate for later use
+                                                                server_certificate = Some(certificate);
+                                                            }
+                                                        }
+                                                        HandshakeType::CertificateVerify => {
+                                                            info!("Processing CertificateVerify message");
+                                                            if let HandshakeMessage::CertificateVerify(cert_verify) = handshake.message {
+                                                                debug!("CertificateVerify received");
+
+                                                                // Access the saved certificate
+                                                                let certificate = server_certificate.as_ref()
+                                                                    .expect("Certificate missing but required for CertificateVerify");
+                    
+                                                                // Verify the server's signature using the transcript hash
+                                                                // This would be implemented in a separate function
+                                                                certificate::verify_certificate_signature(&cert_verify, transcript_manager.get_current_hash(), certificate)
+                                                                    .expect("Failed to verify certificate signature");
                                                             }
                                                         }
                                                         HandshakeType::EncryptedExtensions => {
@@ -634,8 +703,26 @@ fn main() {
                                                             info!("Processing Finished message");
                                                             if let HandshakeMessage::Finished(finished) = handshake.message {
                                                                 debug!("Finished: {:?}", finished);
-                                                                // Add logic to handle the Finished message
-                                                                // For example, verify the Finished message
+                                                            
+                                                                // Pass the finished (which is a Vec<u8>) to the verify function
+                                                                verify_server_finished(&finished.verify_data, transcript_manager.get_current_hash(), &handshake_keys)
+                                                                    .expect("Failed to verify server Finished message");
+
+                                                                // Mark handshake as complete
+                                                                info!("Server Finished message received, sending Client Finished");
+                    
+                                                                // Now create and send Client Finished
+                                                                send_client_finished(&mut stream, &mut handshake_keys, transcript_manager.get_current_hash())
+                                                                    .expect("Failed to send Client Finished");
+                                                                info!("Handshake completed");
+                                                                
+                                                                // // Now send HTTP GET request
+                                                                // let http_request = format!(
+                                                                //     "GET /robots.txt HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", 
+                                                                //     hostname
+                                                                // );
+                                                                
+                                                                // send_application_data(&mut stream, &mut handshake_keys, http_request.as_bytes())?;
                                                             }
                                                         }
                                                         _ => {
@@ -698,6 +785,93 @@ fn main() {
     }
 }
 
+/// Verify the server's Finished message
+fn verify_server_finished(
+    finished: &Vec<u8>,
+    transcript_hash: &[u8],
+    handshake_keys: &HandshakeKeys,
+) -> Result<(), String> {
+    // Create an HMAC context with the server finished key
+    let mut hmac = <Hmac<Sha256> as KeyInit>::new_from_slice(&handshake_keys.server_hs_finished_key)
+    .map_err(|e| format!("Failed to create HMAC: {}", e))?;
+    
+    // Update with the transcript hash
+    hmac.update(transcript_hash);
+    
+    // Compute the expected verify data
+    let expected_verify_data = hmac.finalize().into_bytes().to_vec();
+    
+    debug!("Expected server verify data: {}", tls13tutorial::display::to_hex(&expected_verify_data));
+    debug!("Received server verify data: {}", tls13tutorial::display::to_hex(finished));
+    
+    // Compare with the received Finished message
+    if &expected_verify_data[..] != finished.as_slice() {
+        return Err("Server Finished verification failed".to_string());
+    }
+    
+    info!("Server Finished message verified successfully");
+    Ok(())
+}
+
+fn send_client_finished(
+    stream: &mut TcpStream,
+    handshake_keys: &mut HandshakeKeys,
+    transcript_hash: &[u8]
+) -> Result<(), String> {
+    // warn!("Sending Client Finished message not implemented yet");
+    // Err(("Sending Client Finished message not implemented yet").to_string())
+
+    // Create verify_data using HMAC with client_hs_finished_key
+    let hmac = <Hmac<Sha256> as KeyInit>::new_from_slice(&handshake_keys.client_hs_finished_key)
+        .map_err(|e| format!("HMAC error: {}", e))?;
+    let mut hmac_ctx = hmac;
+    hmac_ctx.update(transcript_hash);
+    let verify_data = hmac_ctx.finalize().into_bytes().to_vec();
+    
+    debug!("Verify data for Finished: {}", to_hex(&verify_data));
+    
+    // Create Finished handshake message
+    let finished = HandshakeMessage::Finished(tls13tutorial::handshake::Finished {
+        verify_data: verify_data.clone()
+    });
+    let handshake = Handshake {
+        msg_type: HandshakeType::Finished,
+        length: u32::try_from(verify_data.len()).expect("Finished data too long"),
+        message: finished,
+    };
+    
+    let finished_bytes = handshake
+        .as_bytes()
+        .expect("Failed to serialize Finished message");
+    
+    // In TLS 1.3, handshake messages are encrypted after the ServerHello
+    // We need to add the content type for the inner plaintext
+    let mut plaintext = finished_bytes;
+    plaintext.push(ContentType::Handshake as u8);
+    
+    // Encrypt the Finished message
+    let ciphertext = handshake_keys.encrypt_client_handshake(&plaintext)?;
+    
+    // Create the TLS record
+    let record = TLSRecord {
+        record_type: ContentType::ApplicationData, // All encrypted records use ApplicationData
+        legacy_record_version: TLS_VERSION_COMPATIBILITY,
+        length: u16::try_from(ciphertext.len()).expect("Ciphertext too long"),
+        fragment: ciphertext,
+    };
+    
+    // Send the record
+    let record_bytes = record
+        .as_bytes()
+        .expect("Failed to serialize TLS record");
+    
+    stream.write_all(&record_bytes)
+        .map_err(|e| format!("Failed to send Finished message: {}", e))?;
+    
+    info!("Client Finished message sent successfully");
+    Ok(())
+}
+
 /// Process and verify a TLS 1.3 EncryptedExtensions message
 /// This function analyzes the extensions provided by the server
 fn process_encrypted_extensions_message(
@@ -737,7 +911,16 @@ fn process_encrypted_extensions_message(
                 }
             }
             ExtensionType::ServerName => {
-                info!("ServerName extension received (unexpected in EncryptedExtensions)");
+                info!("ServerName extension received");
+                // Check that the sernver name extension is empty
+                if let ExtensionData::ServerName(server_name) = &ext.extension_data {
+                    if server_name.server_name_list.is_empty() {
+                        info!("ServerName extension is empty");
+                    } else {
+                        warn!("ServerName extension should be empty in EncryptedExtensions");
+                    }
+                }
+
             }
             ExtensionType::SupportedVersions => {
                 if let ExtensionData::SupportedVersions(versions) = &ext.extension_data {

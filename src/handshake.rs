@@ -56,7 +56,7 @@ pub mod cipher_suites {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum HandshakeType {
     ClientHello = 1,
     ServerHello = 2,
@@ -79,7 +79,7 @@ pub enum HandshakeMessage {
     EncryptedExtensions(EncryptedExtensions),
     CertificateRequest,
     Certificate(Certificate),
-    CertificateVerify,
+    CertificateVerify(CertificateVerify),
     Finished(Finished),
     NewSessionTicket,
     KeyUpdate,
@@ -157,6 +157,10 @@ impl ByteSerializable for Handshake {
                 let certificate = Certificate::from_bytes(bytes)?;
                 HandshakeMessage::Certificate(*certificate)
             }
+            HandshakeType::CertificateVerify => {
+                let cert_verify = CertificateVerify::from_bytes(bytes)?;
+                HandshakeMessage::CertificateVerify(*cert_verify)
+            },
             HandshakeType::Finished => {
                 let finished = Finished::from_bytes(bytes)?;
                 HandshakeMessage::Finished(*finished)
@@ -176,6 +180,77 @@ impl ByteSerializable for Handshake {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CertificateVerify {
+    pub algorithm: crate::extensions::SignatureScheme,
+    pub signature: Vec<u8>,  // Length prefixed with 2 bytes
+}
+
+impl ByteSerializable for CertificateVerify {
+    fn as_bytes(&self) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        
+        // Encode the signature algorithm (2 bytes)
+        bytes.extend_from_slice(&(self.algorithm as u16).to_be_bytes());
+        
+        // Encode the signature length (2 bytes) followed by the signature data
+        bytes.extend_from_slice(&u16::try_from(self.signature.len()).ok()?.to_be_bytes());
+        bytes.extend_from_slice(&self.signature);
+        
+        Some(bytes)
+    }
+    
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        debug!("Parsing CertificateVerify message");
+        
+        // Parse the signature algorithm (2 bytes)
+        let algo_value = bytes.get_u16().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to read signature algorithm"
+            )
+        })?;
+        
+        let algorithm = match algo_value {
+            0x0403 => crate::extensions::SignatureScheme::EcdsaSecp256r1Sha256,
+            0x0503 => crate::extensions::SignatureScheme::EcdsaSecp384r1Sha384,
+            0x0603 => crate::extensions::SignatureScheme::EcdsaSecp521r1Sha512,
+            0x0807 => crate::extensions::SignatureScheme::Ed25519,
+            0x0808 => crate::extensions::SignatureScheme::Ed448,
+            // Add other signature schemes as needed
+            _ => return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported signature algorithm: 0x{:04x}", algo_value)
+            )),
+        };
+        
+        // Parse the signature length (2 bytes)
+        let sig_len = bytes.get_u16().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to read signature length"
+            )
+        })?;
+        
+        // Parse the signature data
+        let signature = bytes.get_bytes(sig_len as usize);
+        if signature.len() != sig_len as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid signature data length"
+            ));
+        }
+        
+        debug!("Parsed CertificateVerify: algorithm={:?}, signature length={}", 
+               algorithm, signature.len());
+        
+        Ok(Box::new(CertificateVerify {
+            algorithm,
+            signature,
+        }))
+    }
+}
+
 /// `Finished` message is the final message in the Authentication Block.
 #[derive(Debug, Clone)]
 pub struct Finished {
@@ -183,10 +258,24 @@ pub struct Finished {
 }
 impl ByteSerializable for Finished {
     fn as_bytes(&self) -> Option<Vec<u8>> {
-        todo!("Implement Finished::as_bytes")
+        // The Finished message is simply the verify_data with no length prefix
+        // because the length is already encoded in the Handshake message header
+        Some(self.verify_data.clone())
     }
-    fn from_bytes(_bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
-        todo!("Implement Finished::from_bytes")
+    
+    fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
+        debug!("Parsing Finished message, {} bytes available", bytes.len());
+        
+        // In TLS 1.3, the Finished message consists of the verify_data with no length prefix
+        // The length is determined by the Handshake message header
+        // So we just read all remaining bytes as the verify_data
+        let verify_data = bytes.drain();
+        
+        debug!("Parsed Finished message with {} bytes of verify_data", verify_data.len());
+        
+        Ok(Box::new(Finished { 
+            verify_data 
+        }))
     }
 }
 
