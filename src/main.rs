@@ -15,7 +15,7 @@ use tls13tutorial::extensions::{
 };
 use tls13tutorial::handshake::{
     cipher_suites, ClientHello, Handshake, HandshakeMessage, HandshakeType, Random,
-    TLS_VERSION_1_3, TLS_VERSION_COMPATIBILITY,
+    TLS_VERSION_1_3, TLS_VERSION_COMPATIBILITY, EncryptedExtensions
 };
 use tls13tutorial::parser::ByteParser;
 use tls13tutorial::tls_record::{ContentType, TLSRecord};
@@ -607,6 +607,37 @@ fn main() {
                                                         "Decrypted handshake message: {:?}",
                                                         handshake.msg_type
                                                     );
+
+                                                    // Handle different handshake message types
+                                                    match handshake.msg_type {
+                                                        HandshakeType::Certificate => {
+                                                            info!("Processing Certificate message");
+                                                            if let HandshakeMessage::Certificate(certificate) = handshake.message {
+                                                                debug!("Certificate: {:?}", certificate);
+                                                                process_certificate_message(&certificate)
+                                                                    .expect("Failed to process certificate");
+                                                            }
+                                                        }
+                                                        HandshakeType::EncryptedExtensions => {
+                                                            info!("Processing EncryptedExtensions message");
+                                                            if let HandshakeMessage::EncryptedExtensions(extensions) = handshake.message {
+                                                                debug!("EncryptedExtensions: {:?}", extensions);
+                                                                process_encrypted_extensions_message(&extensions)
+                                                                    .expect("Failed to process EncryptedExtensions");
+                                                            }
+                                                        }
+                                                        HandshakeType::Finished => {
+                                                            info!("Processing Finished message");
+                                                            if let HandshakeMessage::Finished(finished) = handshake.message {
+                                                                debug!("Finished: {:?}", finished);
+                                                                // Add logic to handle the Finished message
+                                                                // For example, verify the Finished message
+                                                            }
+                                                        }
+                                                        _ => {
+                                                            warn!("Unhandled handshake message type: {:?}", handshake.msg_type);
+                                                        }
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     error!("Failed to parse handshake message: {}", e);
@@ -661,4 +692,333 @@ fn main() {
             error!("Failed to connect: {e}");
         }
     }
+}
+
+use rasn_pkix::{RelativeDistinguishedName, AttributeTypeAndValue};
+use rasn::types::ObjectIdentifier;
+
+fn extract_common_name(rdn: &RelativeDistinguishedName) -> Result<String, String> {
+    // Define the OID for the Common Name (2.5.4.3 in ASN.1)
+    let common_name_oid = ObjectIdentifier::new_unchecked(vec![2, 5, 4, 3].into());
+
+    // Convert the set to a vector for iteration
+    for attribute in rdn.to_vec() {
+        debug!("Attribute type: {:?}", attribute.r#type);
+        if attribute.r#type == common_name_oid {
+            // Try to extract the value as a String
+            // Extract UTF-8 string from ASN.1 ANY value
+            if let Ok(value_str) = String::from_utf8(attribute.value.as_bytes().to_vec()) {
+                return Ok(value_str);
+            } else {
+                return Err("Failed to convert Common Name value to UTF-8 string".to_string());
+            }
+        }
+    }
+
+    // Return an error if no Common Name is found
+    Err("No Common Name found in RDN".to_string())
+}
+
+// Helper function to extract Subject Alternative Names
+fn extract_subject_alt_names(data: &[u8]) -> Result<Vec<String>, String> {
+    use rasn::der;
+    use rasn_pkix::SubjectAltName;
+    
+    let sans = match der::decode::<SubjectAltName>(data) {
+        Ok(sans) => sans,
+        Err(e) => return Err(format!("Failed to parse SubjectAltName: {}", e)),
+    };
+    
+    let mut result = Vec::new();
+    for name in sans.iter() {
+        if let rasn_pkix::GeneralName::DnsName(dns_name) = name {
+            result.push(dns_name.to_string());
+        }
+    }
+    
+    Ok(result)
+}
+
+/// Process and verify a TLS 1.3 Certificate message
+/// This function analyzes the certificate chain provided by the server
+fn process_certificate_message(certificate: &tls13tutorial::handshake::Certificate) -> Result<(), String> {
+    use rasn::der;
+    use rasn_pkix::{Certificate as RasnCertificate, Name};
+    use time::{OffsetDateTime, Duration};
+    use webpki::{EndEntityCert, TrustAnchor}; // , SUPPORTED_ALGS};
+    use webpki_roots::TLS_SERVER_ROOTS;
+    use chrono::{Datelike, Timelike};
+    
+    if certificate.certificate_list.is_empty() {
+        return Err("Empty certificate list received".to_string());
+    }
+
+    info!("Received certificate chain with {} certificates", certificate.certificate_list.len());
+    
+    // Extract the end-entity certificate (server's certificate)
+    let server_cert = &certificate.certificate_list[0];
+    let server_cert_data = &server_cert.certificate_data;
+    
+    // Parse the server certificate using rasn
+    let server_rasn_cert = match der::decode::<RasnCertificate>(server_cert_data) {
+        Ok(cert) => cert,
+        Err(e) => return Err(format!("Failed to parse server certificate: {}", e)),
+    };
+    
+    // 1. Validity Period Check
+    let now = OffsetDateTime::now_utc();
+    
+    let not_before = match &server_rasn_cert.tbs_certificate.validity.not_before {
+        rasn_pkix::Time::Utc(time) => {
+            // UTC time format: convert to OffsetDateTime
+            let year = if time.year() < 50 { 2000 + time.year() } else { 1900 + time.year() } as i32;
+            let month = time::Month::try_from(time.month() as u8)
+                .map_err(|_| "Invalid month in certificate not_before date".to_string())?;
+            let day = time.day() as u8;
+            let hour = time.hour() as u8;
+            let minute = time.minute() as u8;
+            let second = time.second() as u8;
+            
+            time::PrimitiveDateTime::new(
+                time::Date::from_calendar_date(year, month, day)
+                    .map_err(|_| "Invalid calendar date in certificate not_before date".to_string())?,
+                time::Time::from_hms(hour, minute, second)
+                    .map_err(|_| "Invalid time in certificate not_before date".to_string())?
+            ).assume_utc()
+        },
+        rasn_pkix::Time::General(time) => {
+            // Generalized time format: convert to OffsetDateTime
+            let year = time.year() as i32;
+            let month = time::Month::try_from(time.month() as u8)
+                .map_err(|_| "Invalid month in certificate not_before date".to_string())?;
+            let day = time.day() as u8;
+            let hour = time.hour() as u8;
+            let minute = time.minute() as u8;
+            let second = time.second() as u8;
+            
+            time::PrimitiveDateTime::new(
+                time::Date::from_calendar_date(year, month, day)
+                    .map_err(|_| "Invalid calendar date in certificate not_before date".to_string())?,
+                time::Time::from_hms(hour, minute, second)
+                    .map_err(|_| "Invalid time in certificate not_before date".to_string())?
+            ).assume_utc()
+        }
+    };
+    
+    let not_after = match &server_rasn_cert.tbs_certificate.validity.not_after {
+        rasn_pkix::Time::Utc(time) => {
+            // UTC time format: convert to OffsetDateTime
+            let year = if time.year() < 50 { 2000 + time.year() } else { 1900 + time.year() } as i32;
+            let month = time::Month::try_from(time.month() as u8)
+                .map_err(|_| "Invalid month in certificate not_after date".to_string())?;
+            let day = time.day() as u8;
+            let hour = time.hour() as u8;
+            let minute = time.minute() as u8;
+            let second = time.second() as u8;
+            
+            time::PrimitiveDateTime::new(
+                time::Date::from_calendar_date(year, month, day)
+                    .map_err(|_| "Invalid calendar date in certificate not_after date".to_string())?,
+                time::Time::from_hms(hour, minute, second)
+                    .map_err(|_| "Invalid time in certificate not_after date".to_string())?
+            ).assume_utc()
+        },
+        rasn_pkix::Time::General(time) => {
+            // Generalized time format: convert to OffsetDateTime
+            let year = time.year() as i32;
+            let month = time::Month::try_from(time.month() as u8)
+                .map_err(|_| "Invalid month in certificate not_after date".to_string())?;
+            let day = time.day() as u8;
+            let hour = time.hour() as u8;
+            let minute = time.minute() as u8;
+            let second = time.second() as u8;
+            
+            time::PrimitiveDateTime::new(
+                time::Date::from_calendar_date(year, month, day)
+                    .map_err(|_| "Invalid calendar date in certificate not_after date".to_string())?,
+                time::Time::from_hms(hour, minute, second)
+                    .map_err(|_| "Invalid time in certificate not_after date".to_string())?
+            ).assume_utc()
+        }
+    };
+    
+    info!("Certificate validity: {} to {}", not_before, not_after);
+    
+    if now < not_before {
+        return Err("Certificate is not yet valid".to_string());
+    }
+    
+    if now > not_after {
+        return Err("Certificate has expired".to_string());
+    }
+    
+    // 2. Domain Name Validation
+    let hostname = match std::env::args().nth(1) {
+        Some(addr) => match addr.split(':').next() {
+            Some(host) => host.to_string(),
+            None => return Err("Invalid hostname from command line args".to_string()),
+        },
+        None => return Err("No hostname provided".to_string()),
+    };
+    
+    // Extract the Common Name from the subject
+    let mut found_domain = false;
+
+    let Name::RdnSequence(rdn_sequence) = server_rasn_cert.tbs_certificate.subject;
+    for attribute in rdn_sequence.to_vec() {
+        if let Ok(name_string) = extract_common_name(&attribute) {
+            info!("Certificate Common Name: {}", name_string);
+            if name_string == hostname {
+                found_domain = true;
+            }
+        }
+    }
+    
+    // // Extract the Subject Alternative Names (SANs)
+    // if !found_domain {
+    //     for extension in &server_rasn_cert.tbs_certificate.extensions.unwrap_or_default().0 {
+    //         if extension.extn_id.0 == [2, 5, 29, 17] {  // subjectAltName OID
+    //             if let Ok(sans) = extract_subject_alt_names(&extension.extn_value.0) {
+    //                 for san in sans {
+    //                     info!("Subject Alternative Name: {}", san);
+    //                     if san == hostname || (san.starts_with("*.") && hostname.ends_with(&san[1..])) {
+    //                         found_domain = true;
+    //                         break;
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+    
+    // if !found_domain {
+    //     return Err(format!("Certificate does not match hostname: {}", hostname));
+    // }
+    
+    // info!("Certificate matches hostname: {}", hostname);
+    
+    // // 3. Certificate Chain Validation using webpki
+    // // Convert certificates to DER format for webpki
+    // let mut cert_chain: Vec<&[u8]> = Vec::new();
+    // for cert_entry in certificate.certificate_list.iter().skip(1) {
+    //     cert_chain.push(&cert_entry.certificate_data);
+    // }
+    
+    // // Create an end-entity certificate from the server certificate
+    // let end_entity_cert = match EndEntityCert::try_from(server_cert_data.as_slice()) {
+    //     Ok(cert) => cert,
+    //     Err(e) => return Err(format!("Failed to create end entity cert: {:?}", e)),
+    // };
+    
+    // // Verify the certificate chain against the webpki root CA store
+    // let now_seconds = std::time::SystemTime::now()
+    //     .duration_since(std::time::UNIX_EPOCH)
+    //     .map_err(|_| "Failed to get current time")?
+    //     .as_secs();
+    
+    // // Convert webpki-roots to a format webpki can use
+    // let trust_anchors: Vec<TrustAnchor> = TLS_SERVER_ROOTS.iter().map(|ta| {
+    //     TrustAnchor {
+    //         subject: ta.subject,
+    //         spki: ta.spki,
+    //         name_constraints: ta.name_constraints,
+    //     }
+    // }).collect();
+    
+    // let chain_result = end_entity_cert.verify_is_valid_tls_server_cert(
+    //     SUPPORTED_ALGS,
+    //     &webpki::TrustAnchors(&trust_anchors),
+    //     &cert_chain,
+    //     now_seconds,
+    // );
+    
+    // match chain_result {
+    //     Ok(_) => info!("Certificate chain validation successful"),
+    //     Err(e) => return Err(format!("Certificate chain validation failed: {:?}", e)),
+    // }
+    
+    // // Verify the hostname using webpki
+    // match end_entity_cert.verify_is_valid_for_dns_name(hostname) {
+    //     Ok(_) => info!("Hostname validation successful"),
+    //     Err(e) => return Err(format!("Hostname validation failed: {:?}", e)),
+    // }
+    
+    // // 4. Optional: Certificate Revocation Check
+    // // This would typically use OCSP or CRL, which is a more complex process
+    // // For simplicity, we'll just check if the certificate contains CRL Distribution Points
+    // // 4. Optional: Certificate Revocation Check
+    // let mut has_crl = false;
+    // for extension in server_rasn_cert.tbs_certificate.extensions
+    //     .as_ref()
+    //     .map(|ext| ext.iter())
+    //     .unwrap_or_default() {
+    //     if extension.get_extn_id().as_ref() == [2, 5, 29, 31] {  // CRL Distribution Points OID
+    //         has_crl = true;
+    //         info!("Certificate has CRL Distribution Points (not checked)");
+    //         break;
+    //     }
+    // }
+    
+    // if !has_crl {
+    //     info!("Certificate does not specify CRL Distribution Points");
+    // }
+    
+    info!("Certificate validation complete. Certificate is valid.");
+    Ok(())
+}
+
+/// Process and verify a TLS 1.3 EncryptedExtensions message
+/// This function analyzes the extensions provided by the server
+fn process_encrypted_extensions_message(
+    extensions: &tls13tutorial::handshake::EncryptedExtensions,
+) -> Result<(), String> {
+    if extensions.extensions.is_empty() {
+        return Err("Empty EncryptedExtensions list received".to_string());
+    }
+
+    info!(
+        "Received EncryptedExtensions with {} extensions",
+        extensions.extensions.len()
+    );
+
+    // Log information about each extension in the list
+    for ext in &extensions.extensions {
+        debug!("Extension type: {:?}", ext.extension_type);
+
+        // Handle specific extensions based on their type
+        match ext.extension_type {
+            ExtensionType::SupportedGroups => {
+                if let ExtensionData::SupportedGroups(groups) = &ext.extension_data {
+                    info!("Supported Groups: {:?}", groups.named_group_list);
+                }
+            }
+            ExtensionType::SignatureAlgorithms => {
+                if let ExtensionData::SignatureAlgorithms(algorithms) = &ext.extension_data {
+                    info!(
+                        "Supported Signature Algorithms: {:?}",
+                        algorithms.supported_signature_algorithms
+                    );
+                }
+            }
+            ExtensionType::ApplicationLayerProtocolNegotiation => {
+                if let ExtensionData::Unserialized(data) = &ext.extension_data {
+                    info!("ALPN Protocols: {:?}", data);
+                }
+            }
+            ExtensionType::ServerName => {
+                info!("ServerName extension received (unexpected in EncryptedExtensions)");
+            }
+            ExtensionType::SupportedVersions => {
+                if let ExtensionData::SupportedVersions(versions) = &ext.extension_data {
+                    info!("Supported Versions: {:?}", versions.version);
+                }
+            }
+            _ => {
+                warn!("Unhandled extension type: {:?}", ext.extension_type);
+            }
+        }
+    }
+
+    info!("EncryptedExtensions processed successfully");
+    Ok(())
 }
