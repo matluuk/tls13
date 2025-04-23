@@ -2,6 +2,7 @@
 use log::{debug, error, info, warn};
 #[cfg(not(debug_assertions))]
 use rand::rngs::OsRng;
+use rasn::de;
 use std::collections::VecDeque;
 use std::io::{self, Read as SocketRead, Write as SocketWrite};
 use std::net::TcpStream;
@@ -770,8 +771,9 @@ fn process_certificate_message(certificate: &tls13tutorial::handshake::Certifica
     
     let not_before = match &server_rasn_cert.tbs_certificate.validity.not_before {
         rasn_pkix::Time::Utc(time) => {
+            debug!("UTC time format detected");
             // UTC time format: convert to OffsetDateTime
-            let year = if time.year() < 50 { 2000 + time.year() } else { 1900 + time.year() } as i32;
+            let year = time.year();
             let month = time::Month::try_from(time.month() as u8)
                 .map_err(|_| "Invalid month in certificate not_before date".to_string())?;
             let day = time.day() as u8;
@@ -779,6 +781,8 @@ fn process_certificate_message(certificate: &tls13tutorial::handshake::Certifica
             let minute = time.minute() as u8;
             let second = time.second() as u8;
             
+            debug!("Parsed not_before date: {}-{}-{} {}:{}:{}", year, month, day, hour, minute, second);
+
             time::PrimitiveDateTime::new(
                 time::Date::from_calendar_date(year, month, day)
                     .map_err(|_| "Invalid calendar date in certificate not_before date".to_string())?,
@@ -787,8 +791,10 @@ fn process_certificate_message(certificate: &tls13tutorial::handshake::Certifica
             ).assume_utc()
         },
         rasn_pkix::Time::General(time) => {
-            // Generalized time format: convert to OffsetDateTime
-            let year = time.year() as i32;
+            debug!("Generalized time format detected");
+            // Generalized time format already has a 4-digit year
+            // Just use it directly without any conversion
+            let year = time.year();
             let month = time::Month::try_from(time.month() as u8)
                 .map_err(|_| "Invalid month in certificate not_before date".to_string())?;
             let day = time.day() as u8;
@@ -796,6 +802,8 @@ fn process_certificate_message(certificate: &tls13tutorial::handshake::Certifica
             let minute = time.minute() as u8;
             let second = time.second() as u8;
             
+            debug!("Parsed not_before date: {}-{}-{} {}:{}:{}", year, month, day, hour, minute, second);
+
             time::PrimitiveDateTime::new(
                 time::Date::from_calendar_date(year, month, day)
                     .map_err(|_| "Invalid calendar date in certificate not_before date".to_string())?,
@@ -807,15 +815,19 @@ fn process_certificate_message(certificate: &tls13tutorial::handshake::Certifica
     
     let not_after = match &server_rasn_cert.tbs_certificate.validity.not_after {
         rasn_pkix::Time::Utc(time) => {
+            debug!("UTC time format detected");
             // UTC time format: convert to OffsetDateTime
-            let year = if time.year() < 50 { 2000 + time.year() } else { 1900 + time.year() } as i32;
+            let year = time.year();
             let month = time::Month::try_from(time.month() as u8)
                 .map_err(|_| "Invalid month in certificate not_after date".to_string())?;
             let day = time.day() as u8;
             let hour = time.hour() as u8;
             let minute = time.minute() as u8;
             let second = time.second() as u8;
+
             
+            debug!("Parsed not_after date: {}-{}-{} {}:{}:{}", year, month, day, hour, minute, second);
+
             time::PrimitiveDateTime::new(
                 time::Date::from_calendar_date(year, month, day)
                     .map_err(|_| "Invalid calendar date in certificate not_after date".to_string())?,
@@ -824,14 +836,17 @@ fn process_certificate_message(certificate: &tls13tutorial::handshake::Certifica
             ).assume_utc()
         },
         rasn_pkix::Time::General(time) => {
-            // Generalized time format: convert to OffsetDateTime
-            let year = time.year() as i32;
+            debug!("Generalized time format detected");
+            // Generalized time format uses 4-digit year directly
+            let year = time.year();
             let month = time::Month::try_from(time.month() as u8)
                 .map_err(|_| "Invalid month in certificate not_after date".to_string())?;
             let day = time.day() as u8;
             let hour = time.hour() as u8;
             let minute = time.minute() as u8;
             let second = time.second() as u8;
+
+            debug!("Parsed not_after date: {}-{}-{} {}:{}:{}", year, month, day, hour, minute, second);
             
             time::PrimitiveDateTime::new(
                 time::Date::from_calendar_date(year, month, day)
