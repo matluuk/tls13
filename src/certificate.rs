@@ -493,7 +493,7 @@ pub fn process_certificate_message(
     //     info!("Certificate does not specify CRL Distribution Points");
     // }
     
-    info!("Certificate validation complete. Certificate is valid.");
+    // info!("Certificate validation complete. Certificate is valid.");
     Ok(())
 }
 
@@ -553,17 +553,24 @@ pub fn verify_certificate_signature(
                 ));
             }
             
-            let mut sig_bytes = [0u8; 64];
-            sig_bytes.copy_from_slice(&cert_verify.signature);
-            
-            let signature = Ed25519Signature::from_bytes(&sig_bytes);
+            let signature = match Ed25519Signature::try_from(&cert_verify.signature[..]) {
+                Ok(sig) => sig,
+                Err(e) => return Err(format!("Failed to parse Ed25519 signature: {}", e)),
+            };
             
             // Verify the signature
-            server_public_key.verify(&message, &signature)
-                .map_err(|e| format!("Ed25519 signature verification failed: {}", e))?;
-            
-            info!("Ed25519 signature verified successfully");
-            Ok(())
+            match server_public_key.verify(&message, &signature) {
+                Ok(_) => {
+                    info!("Ed25519 signature verified successfully");
+                    Ok(())
+                },
+                Err(e) => {
+                    // For debugging purposes, let's log more information
+                    debug!("Transcript hash: {}", tls13tutorial::display::to_hex(transcript_hash));
+                    debug!("Public key: {}", tls13tutorial::display::to_hex(&server_public_key.to_bytes()));
+                    Err(format!("Ed25519 signature verification failed: {}", e))
+                }
+            }
         },
         other_alg => {
             warn!("Unsupported signature algorithm: {:?}", other_alg);

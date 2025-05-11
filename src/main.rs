@@ -59,6 +59,9 @@ impl TranscriptManager {
 
     /// Add a new handshake message to the transcript and update the hash
     fn update(&mut self, message: &[u8]) {
+        // Debug: Print the message bytes being added
+        debug!("Adding message to transcript: {}", to_hex(message));
+
         // Store the raw message
         self.messages.push(message.to_vec());
         
@@ -360,6 +363,206 @@ impl HandshakeKeys {
     }
 }
 
+/// Keys used for application data encryption/decryption after the handshake is complete
+struct ApplicationKeys {
+    client_app_key: Vec<u8>,
+    client_app_iv: Vec<u8>,
+    client_seq_num: u64,
+    server_app_key: Vec<u8>,
+    server_app_iv: Vec<u8>,
+    server_seq_num: u64,
+}
+
+impl ApplicationKeys {
+    /// Derive application traffic keys from the handshake secret
+    fn new(handshake_keys: &HandshakeKeys, transcript_hash: &[u8]) -> Result<Self, String> {
+        // Get the shared secret that was established during the handshake
+        let shared_secret = handshake_keys.dh_shared_secret.as_ref()
+            .expect("Shared secret must be established before calculating application keys");
+            
+        // Early secret - similar to handshake key calculation
+        let (early_secret, _) = Hkdf::<Sha256>::extract(Some(&[0u8; 32]), &[0u8; 32]);
+        
+        // Derive secret from early secret
+        let sha256_empty = Sha256::digest([]);
+        let derived_secret = HandshakeKeys::derive_secret(&early_secret, b"derived", &sha256_empty, 32);
+        
+        // Extract handshake secret using DH shared secret
+        let (handshake_secret, _) = Hkdf::<Sha256>::extract(
+            Some(&derived_secret),
+            shared_secret.as_bytes(),
+        );
+        
+        // Derive secret for the master secret calculation
+        let derived_secret_for_master = HandshakeKeys::derive_secret(
+            &handshake_secret, b"derived", &sha256_empty, 32
+        );
+        
+        // Extract the master secret using empty key material
+        let (master_secret, _) = Hkdf::<Sha256>::extract(Some(&derived_secret_for_master), &[0u8; 32]);
+        
+        debug!("Master secret: {}", to_hex(&master_secret));
+        
+        // Derive client and server application traffic secrets
+        let client_app_traffic_secret = HandshakeKeys::derive_secret(
+            &master_secret, b"c ap traffic", transcript_hash, 32
+        );
+        let server_app_traffic_secret = HandshakeKeys::derive_secret(
+            &master_secret, b"s ap traffic", transcript_hash, 32
+        );
+        
+        // Derive application keys and IVs
+        let client_app_key = HandshakeKeys::derive_secret(&client_app_traffic_secret, b"key", &[], 32);
+        let client_app_iv = HandshakeKeys::derive_secret(&client_app_traffic_secret, b"iv", &[], 12);
+        let server_app_key = HandshakeKeys::derive_secret(&server_app_traffic_secret, b"key", &[], 32);
+        let server_app_iv = HandshakeKeys::derive_secret(&server_app_traffic_secret, b"iv", &[], 12);
+        
+        debug!("Client application traffic secret: {}", to_hex(&client_app_traffic_secret));
+        debug!("Server application traffic secret: {}", to_hex(&server_app_traffic_secret));
+        debug!("Client application key: {}", to_hex(&client_app_key));
+        debug!("Client application IV: {}", to_hex(&client_app_iv));
+        debug!("Server application key: {}", to_hex(&server_app_key));
+        debug!("Server application IV: {}", to_hex(&server_app_iv));
+        
+        Ok(Self {
+            client_app_key,
+            client_app_iv,
+            client_seq_num: 0,
+            server_app_key,
+            server_app_iv,
+            server_seq_num: 0,
+        })
+    }
+    
+    /// Encrypt application data using client keys
+    fn encrypt_client_application_data(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        // Initialize ChaCha20-Poly1305 cipher with client application key
+        let cipher = match ChaCha20Poly1305::new_from_slice(&self.client_app_key) {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Failed to create ChaCha20Poly1305 cipher: {}", e)),
+        };
+        
+        // Create nonce by XORing IV with sequence number
+        let mut nonce = [0u8; 12];
+        let seq_bytes = self.client_seq_num.to_be_bytes();
+        
+        // Copy IV first
+        nonce.copy_from_slice(&self.client_app_iv);
+        
+        // XOR last 8 bytes with sequence number
+        for i in 4..12 {
+            nonce[i] ^= seq_bytes[i - 4];
+        }
+        
+        debug!("Using client_app_key: {}", to_hex(&self.client_app_key));
+        debug!("Using client_app_iv: {}", to_hex(&self.client_app_iv));
+        debug!("Client app sequence number: {}", self.client_seq_num);
+        debug!("Nonce: {}", to_hex(&nonce));
+        
+        // In TLS 1.3, the additional authenticated data (AAD) is the TLS record header (5 bytes)
+        let record_length = u16::try_from(plaintext.len() + 16).expect("Plaintext too long");
+        let mut aad = vec![ContentType::ApplicationData as u8];
+        aad.extend_from_slice(&TLS_VERSION_COMPATIBILITY.to_be_bytes());
+        aad.extend_from_slice(&record_length.to_be_bytes());
+        debug!("AAD: {}", to_hex(&aad));
+        
+        // Encrypt the message
+        let ciphertext = match cipher.encrypt(
+            &nonce.into(),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        ) {
+            Ok(ct) => ct,
+            Err(e) => return Err(format!("Encryption failed: {}", e)),
+        };
+        
+        // Increment sequence number
+        self.client_seq_num += 1;
+        
+        debug!(
+            "Application data encryption successful, ciphertext length: {}",
+            ciphertext.len()
+        );
+        
+        Ok(ciphertext)
+    }
+    
+    /// Decrypt application data using server keys
+    fn decrypt_server_application_data(
+        &mut self,
+        encrypted_data: &[u8],
+        record_type: ContentType,
+        record_version: u16,
+        record_length: u16,
+    ) -> Result<Vec<u8>, String> {
+        // ChaCha20-Poly1305 authentication tag is 16 bytes
+        if encrypted_data.len() < 16 {
+            return Err("Encrypted data is too short for ChaCha20-Poly1305".to_string());
+        }
+        
+        // Split data into ciphertext and auth tag
+        let ciphertext = &encrypted_data[..encrypted_data.len() - 16];
+        let auth_tag = &encrypted_data[encrypted_data.len() - 16..];
+        
+        // Initialize cipher with server application key
+        let cipher = match ChaCha20Poly1305::new_from_slice(&self.server_app_key) {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Failed to create ChaCha20Poly1305 cipher: {}", e)),
+        };
+        
+        // Create nonce by XORing IV with sequence number
+        let mut nonce = [0u8; 12];
+        let seq_bytes = self.server_seq_num.to_be_bytes();
+        
+        // Copy IV first
+        nonce.copy_from_slice(&self.server_app_iv);
+        
+        // XOR last 8 bytes with sequence number
+        for i in 4..12 {
+            nonce[i] ^= seq_bytes[i - 4];
+        }
+        
+        debug!("Using server_app_key: {}", to_hex(&self.server_app_key));
+        debug!("Using server_app_iv: {}", to_hex(&self.server_app_iv));
+        debug!("Server app sequence number: {}", self.server_seq_num);
+        debug!("Nonce: {}", to_hex(&nonce));
+        
+        // Create AAD from record header
+        let mut aad = vec![record_type as u8];
+        aad.extend_from_slice(&record_version.to_be_bytes());
+        aad.extend_from_slice(&record_length.to_be_bytes());
+        debug!("AAD: {}", to_hex(&aad));
+        
+        // Combine ciphertext and auth tag
+        let mut ciphertext_with_tag = ciphertext.to_vec();
+        ciphertext_with_tag.extend_from_slice(auth_tag);
+        
+        // Decrypt the message
+        let plaintext = match cipher.decrypt(
+            &nonce.into(),
+            Payload {
+                msg: &ciphertext_with_tag,
+                aad: &aad,
+            },
+        ) {
+            Ok(pt) => pt,
+            Err(e) => return Err(format!("Decryption failed: {}", e)),
+        };
+        
+        // Increment sequence number
+        self.server_seq_num += 1;
+        
+        debug!(
+            "Application data decryption successful, plaintext length: {}",
+            plaintext.len()
+        );
+        
+        Ok(plaintext)
+    }
+}
+
 /// Process the data from TCP stream in the chunks of 4096 bytes and
 /// read the response data into a buffer in a form of Queue for easier parsing.
 fn process_tcp_stream(mut stream: &mut TcpStream) -> io::Result<VecDeque<u8>> {
@@ -410,6 +613,7 @@ fn main() {
     };
     // Create initial random values and keys for the handshake
     let mut handshake_keys = HandshakeKeys::new();
+    let mut app_keys: Option<ApplicationKeys> = None;
     
     let mut transcript_manager = TranscriptManager::new();
     let mut server_certificate: Option<tls13tutorial::handshake::Certificate> = None;
@@ -645,6 +849,8 @@ fn main() {
                                 match content_type {
                                     // ContentType::Handshake value (22)
                                     22 => {
+
+                                        
                                         // Parse multiple handshake messages from the decrypted data
                                         let mut parser = ByteParser::from(inner_content.to_vec());
                                         while !parser.is_empty() {
@@ -657,11 +863,13 @@ fn main() {
                                                     let handshake_bytes = handshake
                                                         .as_bytes()
                                                         .expect("Failed to serialize handshake message");
-                                                        
-                                                    // Add to transcript (except for Finished messages)
-                                                    if handshake.msg_type != HandshakeType::Finished {
-                                                        transcript_manager.update(&handshake_bytes);
-                                                    }
+                                                    
+                                                    // Save old hash
+                                                    let old_hash = transcript_manager.get_current_hash().to_vec();
+
+                                                    // Add transcript hash after handling the message
+                                                    transcript_manager.update(&handshake_bytes);
+
 
                                                     // Handle different handshake message types
                                                     match handshake.msg_type {
@@ -686,8 +894,7 @@ fn main() {
                                                                     .expect("Certificate missing but required for CertificateVerify");
                     
                                                                 // Verify the server's signature using the transcript hash
-                                                                // This would be implemented in a separate function
-                                                                certificate::verify_certificate_signature(&cert_verify, transcript_manager.get_current_hash(), certificate)
+                                                                certificate::verify_certificate_signature(&cert_verify, &old_hash, certificate)
                                                                     .expect("Failed to verify certificate signature");
                                                             }
                                                         }
@@ -705,15 +912,25 @@ fn main() {
                                                                 debug!("Finished: {:?}", finished);
                                                             
                                                                 // Pass the finished (which is a Vec<u8>) to the verify function
-                                                                verify_server_finished(&finished.verify_data, transcript_manager.get_current_hash(), &handshake_keys)
+                                                                verify_server_finished(&finished.verify_data, &old_hash, &handshake_keys)
                                                                     .expect("Failed to verify server Finished message");
+
+                                                                let app_keys = ApplicationKeys::new(&handshake_keys, &old_hash)
+                                                                    .expect("Failed to derive application traffic keys");
 
                                                                 // Mark handshake as complete
                                                                 info!("Server Finished message received, sending Client Finished");
-                    
+                                                                
+                                                                info!("Sending ChangeCipherSpec for compatibility");
+                                                                send_change_cipher_spec(&mut stream)
+                                                                    .expect("Failed to send ChangeCipherSpec"); 
+
                                                                 // Now create and send Client Finished
-                                                                send_client_finished(&mut stream, &mut handshake_keys, transcript_manager.get_current_hash())
+                                                                send_client_finished(&mut stream, &mut handshake_keys, &old_hash)
                                                                     .expect("Failed to send Client Finished");
+
+                                                                // Set handshake complete flag
+                                                                handshake_complete = true;
                                                                 info!("Handshake completed");
                                                                 
                                                                 // // Now send HTTP GET request
@@ -798,18 +1015,51 @@ fn verify_server_finished(
     // Update with the transcript hash
     hmac.update(transcript_hash);
     
+    debug!("Transcript hash used for server finished: {}", to_hex(transcript_hash));
+
     // Compute the expected verify data
     let expected_verify_data = hmac.finalize().into_bytes().to_vec();
     
     debug!("Expected server verify data: {}", tls13tutorial::display::to_hex(&expected_verify_data));
     debug!("Received server verify data: {}", tls13tutorial::display::to_hex(finished));
     
+    // warn!("Server Finished message verification not implemented yet");
     // Compare with the received Finished message
     if &expected_verify_data[..] != finished.as_slice() {
         return Err("Server Finished verification failed".to_string());
     }
     
     info!("Server Finished message verified successfully");
+    Ok(())
+}
+
+/// Send a ChangeCipherSpec message for middlebox compatibility
+/// 
+/// In TLS 1.3, this message is not necessary for the protocol but is included
+/// for compatibility with middleboxes that expect it.
+fn send_change_cipher_spec(stream: &mut TcpStream) -> Result<(), String> {
+    // The ChangeCipherSpec message is a single byte with value 1
+    let ccs_data = vec![0x01];
+    
+    // Create the TLS record
+    let record = TLSRecord {
+        record_type: ContentType::ChangeCipherSpec,
+        legacy_record_version: TLS_VERSION_COMPATIBILITY,
+        length: 1,  // ChangeCipherSpec is always 1 byte
+        fragment: ccs_data,
+    };
+    
+    // Serialize and send the record
+    let record_bytes = record
+        .as_bytes()
+        .expect("Failed to serialize ChangeCipherSpec record");
+    
+    debug!("Sending ChangeCipherSpec record: {}", to_hex(&record_bytes));
+    
+    stream.write_all(&record_bytes)
+        .map_err(|e| format!("Failed to send ChangeCipherSpec: {}", e))?;
+    
+    info!("ChangeCipherSpec sent successfully");
     Ok(())
 }
 
@@ -878,7 +1128,8 @@ fn process_encrypted_extensions_message(
     extensions: &tls13tutorial::handshake::EncryptedExtensions,
 ) -> Result<(), String> {
     if extensions.extensions.is_empty() {
-        return Err("Empty EncryptedExtensions list received".to_string());
+        info!("Empty EncryptedExtensions received (which is valid in TLS 1.3)");
+        return Ok(());
     }
 
     info!(
@@ -935,4 +1186,175 @@ fn process_encrypted_extensions_message(
 
     info!("EncryptedExtensions processed successfully");
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    
+    #[test]
+    fn test_transcript_manager_new() {
+        let manager = TranscriptManager::new();
+        assert!(manager.messages.is_empty());
+        assert!(manager.current_hash.is_empty());
+    }
+    
+    #[test]
+    fn test_transcript_manager_single_update() {
+        let mut manager = TranscriptManager::new();
+        let message = b"test message";
+        
+        manager.update(message);
+        
+        // Verify message was stored
+        assert_eq!(manager.messages.len(), 1);
+        assert_eq!(manager.messages[0], message);
+        
+        // Verify hash matches expected value
+        let mut hasher = Sha256::new();
+        hasher.update(message);
+        let expected_hash = hasher.finalize().to_vec();
+        
+        assert_eq!(manager.current_hash, expected_hash);
+    }
+    
+    #[test]
+    fn test_transcript_manager_multiple_updates() {
+        let mut manager = TranscriptManager::new();
+        let message1 = b"first message";
+        let message2 = b"second message";
+        let message3 = b"third message";
+        
+        manager.update(message1);
+        manager.update(message2);
+        manager.update(message3);
+        
+        // Verify all messages were stored in order
+        assert_eq!(manager.messages.len(), 3);
+        assert_eq!(manager.messages[0], message1);
+        assert_eq!(manager.messages[1], message2);
+        assert_eq!(manager.messages[2], message3);
+        
+        // Verify hash matches expected cumulative value
+        let mut hasher = Sha256::new();
+        hasher.update(message1);
+        hasher.update(message2);
+        hasher.update(message3);
+        let expected_hash = hasher.finalize().to_vec();
+        
+        assert_eq!(manager.current_hash, expected_hash);
+    }
+    
+    #[test]
+    fn test_transcript_manager_get_current_hash() {
+        let mut manager = TranscriptManager::new();
+        let message = b"test message";
+        
+        manager.update(message);
+        
+        let mut hasher = Sha256::new();
+        hasher.update(message);
+        let expected_hash = hasher.finalize().to_vec();
+        
+        assert_eq!(manager.get_current_hash(), &expected_hash);
+    }
+    
+    #[test]
+    fn test_transcript_manager_get_messages() {
+        let mut manager = TranscriptManager::new();
+        let message1 = b"first message";
+        let message2 = b"second message";
+        
+        manager.update(message1);
+        manager.update(message2);
+        
+        let messages = manager.get_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], message1);
+        assert_eq!(messages[1], message2);
+    }
+    
+    #[test]
+    fn test_transcript_manager_empty_message() {
+        let mut manager = TranscriptManager::new();
+        let empty_message = b"";
+        
+        manager.update(empty_message);
+        
+        // Check that even empty messages are stored
+        assert_eq!(manager.messages.len(), 1);
+        assert_eq!(manager.messages[0], empty_message);
+        
+        // Verify hash matches hash of empty string
+        let mut hasher = Sha256::new();
+        hasher.update(empty_message);
+        let expected_hash = hasher.finalize().to_vec();
+        
+        assert_eq!(manager.current_hash, expected_hash);
+    }
+    
+    #[test]
+    fn test_transcript_manager_binary_data() {
+        let mut manager = TranscriptManager::new();
+        let binary_data = [0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD];
+        
+        manager.update(&binary_data);
+        
+        // Check binary data was stored correctly
+        assert_eq!(manager.messages.len(), 1);
+        assert_eq!(manager.messages[0], binary_data);
+        
+        // Verify hash matches expected value for binary data
+        let mut hasher = Sha256::new();
+        hasher.update(&binary_data);
+        let expected_hash = hasher.finalize().to_vec();
+        
+        assert_eq!(manager.current_hash, expected_hash);
+    }
+    
+    #[test]
+    fn test_transcript_hash_matches_incremental_vs_cumulative() {
+        // Verify that adding messages incrementally produces the same hash
+        // as hashing all messages together
+        let mut incremental_manager = TranscriptManager::new();
+        let message1 = b"first message";
+        let message2 = b"second message";
+        
+        incremental_manager.update(message1);
+        incremental_manager.update(message2);
+        
+        // Create a second manager and add both messages at once
+        let mut cumulative_manager = TranscriptManager::new();
+        let mut combined = Vec::new();
+        combined.extend_from_slice(message1);
+        combined.extend_from_slice(message2);
+        
+        // This should NOT match because transcript hash is cumulative of separate messages
+        // not a single concatenated message
+        let mut hasher = Sha256::new();
+        hasher.update(&message1);
+        hasher.update(&message2); 
+        let expected_hash = hasher.finalize().to_vec();
+        
+        assert_eq!(incremental_manager.current_hash, expected_hash);
+        assert_ne!(incremental_manager.messages, vec![combined]);
+    }
+    
+    #[test]
+    fn test_transcript_manager_reset() {
+        let mut manager = TranscriptManager::new();
+        
+        // Add some messages
+        manager.update(b"first message");
+        manager.update(b"second message");
+        
+        // "Reset" the manager by creating a new one
+        let manager = TranscriptManager::new();
+        
+        // Verify it's empty
+        assert!(manager.messages.is_empty());
+        assert!(manager.current_hash.is_empty());
+    }
 }

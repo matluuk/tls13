@@ -97,7 +97,7 @@ impl ByteSerializable for Handshake {
         let mut bytes = Vec::new();
         bytes.push(self.msg_type as u8);
         if self.length <= 0x00FF_FFFF {
-            // convert u32 to 3 bytes
+            // Convert u32 to 3 bytes
             bytes.extend_from_slice(&self.length.to_be_bytes()[1..]);
         } else {
             return None;
@@ -106,12 +106,24 @@ impl ByteSerializable for Handshake {
             HandshakeMessage::ClientHello(client_hello) => {
                 bytes.extend_from_slice(&client_hello.as_bytes()?);
             }
+            HandshakeMessage::ServerHello(server_hello) => {
+                bytes.extend_from_slice(&server_hello.as_bytes()?);
+            }
             HandshakeMessage::EncryptedExtensions(encrypted_extensions) => {
                 bytes.extend_from_slice(&encrypted_extensions.as_bytes()?);
+            }
+            HandshakeMessage::Certificate(certificate) => {
+                bytes.extend_from_slice(&certificate.as_bytes()?);
+            }
+            HandshakeMessage::CertificateVerify(certificate_verify) => {
+                bytes.extend_from_slice(&certificate_verify.as_bytes()?);
             }
             HandshakeMessage::Finished(finished) => {
                 bytes.extend_from_slice(&finished.as_bytes()?);
             }
+            // HandshakeMessage::EndOfEarlyData => {
+            //     // EndOfEarlyData has no additional payload
+            // }
             _ => {}
         }
         Some(bytes)
@@ -382,6 +394,7 @@ impl ByteSerializable for ServerHello {
         bytes.extend(ext_bytes);
         Some(bytes)
     }
+
     fn from_bytes(bytes: &mut ByteParser) -> std::io::Result<Box<Self>> {
         #[allow(unused)]
         let checksum: VecDeque<u8>;
