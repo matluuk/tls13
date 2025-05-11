@@ -60,7 +60,6 @@ impl Extension {
         let mut ext_bytes = ByteParser::from(ext_data);
         debug!("Extension data: {:?}", ext_bytes);
         let extension_data = match ext_type {
-            // TODO Implement the rest of the extension types
             0 => {
                 if origin == ExtensionOrigin::Server {
                     // For server-side SNI, the extension data must be empty

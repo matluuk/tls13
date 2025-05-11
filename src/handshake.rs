@@ -734,8 +734,6 @@ impl ByteSerializable for EncryptedExtensions {
 }
 
 
-// TODO: Implement the unittests for this module
-
 #[cfg(test)]
 #[ignore] // Ignore this test for now, as it is not verified as correct
 mod tests {
