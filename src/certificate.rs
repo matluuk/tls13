@@ -1,12 +1,11 @@
 use log::{debug, info, warn};
-use rasn::{de, der};
-use rasn::types::{Any, ObjectIdentifier, SetOf};
-use rasn_pkix::{AttributeTypeAndValue, Certificate as RasnCertificate, Name, RelativeDistinguishedName, SubjectAltName};
+use rasn::der;
+use rasn::types::ObjectIdentifier;
+use rasn_pkix::{Certificate as RasnCertificate, Name, RelativeDistinguishedName};
 // use std::time::Duration;
 // use time::OffsetDateTime;
 use tls13tutorial::handshake::Certificate;
 use webpki::Time;
-use webpki::{TlsServerTrustAnchors, EndEntityCert, TrustAnchor};
 // use webpki_roots::TLS_SERVER_ROOTS;
 use webpki::{ECDSA_P256_SHA256, ECDSA_P256_SHA384, ECDSA_P384_SHA256, ECDSA_P384_SHA384, 
     ED25519};
@@ -243,7 +242,7 @@ pub fn process_certificate_message(
 ) -> Result<(), String> {
     use rasn::der;
     use rasn_pkix::{Certificate as RasnCertificate, Name};
-    use time::{OffsetDateTime, Duration};
+    use time::OffsetDateTime;
     use webpki::{EndEntityCert, TrustAnchor}; // , SUPPORTED_ALGS};
     use webpki_roots::TLS_SERVER_ROOTS;
     use chrono::{Datelike, Timelike};

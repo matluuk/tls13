@@ -2,7 +2,6 @@
 use log::{debug, error, info, warn};
 #[cfg(not(debug_assertions))]
 use rand::rngs::OsRng;
-use rasn::de;
 use std::collections::VecDeque;
 use std::io::{self, Read as SocketRead, Write as SocketWrite};
 use std::net::TcpStream;
@@ -16,7 +15,7 @@ use tls13tutorial::extensions::{
     ServerNameList, SignatureScheme, SupportedSignatureAlgorithms, SupportedVersions, VersionKind,
 };
 use tls13tutorial::handshake::{
-    cipher_suites, ClientHello, EncryptedExtensions, Handshake, HandshakeMessage, HandshakeType,
+    cipher_suites, ClientHello, Handshake, HandshakeMessage, HandshakeType,
     Random, TLS_VERSION_1_3, TLS_VERSION_COMPATIBILITY,
 };
 use tls13tutorial::parser::ByteParser;
@@ -1085,14 +1084,6 @@ fn handle_tls_encrypted_handshake(
                             // Set handshake complete flag
                             *handshake_complete = true;
                             info!("Handshake completed");
-
-                            // // Now send HTTP GET request
-                            // let http_request = format!(
-                            //     "GET /robots.txt HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                            //     hostname
-                            // );
-
-                            // send_application_data(&mut stream, &mut handshake_keys, http_request.as_bytes())?;
                         }
                     }
                     _ => {
@@ -1307,17 +1298,25 @@ fn receive_application_data(
     stream: &mut TcpStream,
     app_keys: &mut ApplicationKeys,
 ) -> Result<Vec<u8>, String> {
-    loop { 
-        let buffer = process_tcp_stream(stream)
-            .map_err(|e| format!("Failed to read stream during application data reception: {}", e))?;
+    loop {
+        let buffer = process_tcp_stream(stream).map_err(|e| {
+            format!(
+                "Failed to read stream during application data reception: {}",
+                e
+            )
+        })?;
 
         if buffer.is_empty() {
             debug!("process_tcp_stream returned empty buffer while waiting for application data.");
             return Err("No application data received with expected inner content type (stream empty or timed out after processing prior messages)".to_string());
         }
 
-        let response_records = tls13tutorial::get_records(buffer.clone())
-            .map_err(|e| format!("Failed to process records during application data reception: {}", e))?;
+        let response_records = tls13tutorial::get_records(buffer.clone()).map_err(|e| {
+            format!(
+                "Failed to process records during application data reception: {}",
+                e
+            )
+        })?;
 
         if response_records.is_empty() && !buffer.is_empty() {
             warn!(
@@ -1325,7 +1324,7 @@ fn receive_application_data(
                 buffer.len(),
                 to_hex(&buffer.into_iter().collect::<Vec<u8>>())
             );
-            continue; 
+            continue;
         }
 
         for record in response_records {
@@ -1339,8 +1338,11 @@ fn receive_application_data(
                     ) {
                         Ok(pt) => pt,
                         Err(e) => {
-                            error!("Failed to decrypt ApplicationData record: {}. Skipping record.", e);
-                            continue; 
+                            error!(
+                                "Failed to decrypt ApplicationData record: {}. Skipping record.",
+                                e
+                            );
+                            continue;
                         }
                     };
 
@@ -1355,29 +1357,30 @@ fn receive_application_data(
                     }
 
                     if end_of_content == 0 {
-                         warn!("Received TLSInnerPlaintext that appears to be all padding or invalid (no content type byte found). Skipping record.");
-                         continue;
+                        warn!("Received TLSInnerPlaintext that appears to be all padding or invalid (no content type byte found). Skipping record.");
+                        continue;
                     }
-                    
+
                     let inner_content_type_val = tls_inner_plaintext[end_of_content - 1];
                     let actual_payload = tls_inner_plaintext[..end_of_content - 1].to_vec();
-                    
+
                     if inner_content_type_val == ContentType::ApplicationData as u8 {
                         info!(
                             "Received inner ApplicationData (type {}), payload length {}",
-                            inner_content_type_val, actual_payload.len()
+                            inner_content_type_val,
+                            actual_payload.len()
                         );
                         info!(
-                            "Received application data (processed): {}", 
+                            "Received application data (processed): {}",
                             String::from_utf8_lossy(&actual_payload)
                         );
-                        return Ok(actual_payload); 
+                        return Ok(actual_payload);
                     } else if inner_content_type_val == ContentType::Handshake as u8 {
                         warn!(
                             "Received inner Handshake message (type {}) within ApplicationData record. Length: {}. Content: {}. Discarding and continuing to look for application data.",
                             inner_content_type_val, actual_payload.len(), to_hex(&actual_payload)
                         );
-                        continue; 
+                        continue;
                     } else if inner_content_type_val == ContentType::Alert as u8 {
                         let alert_level = actual_payload.get(0).copied();
                         let alert_description = actual_payload.get(1).copied();
@@ -1395,24 +1398,30 @@ fn receive_application_data(
                             "Received application data with unexpected inner content type: {}. Length: {}. Content: {}. Discarding and continuing to look for application data.",
                             inner_content_type_val, actual_payload.len(), to_hex(&actual_payload)
                         );
-                        continue; 
+                        continue;
                     }
                 }
                 ContentType::Alert => {
                     match Alert::from_bytes(&mut record.fragment.clone().into()) {
                         Ok(alert) => {
                             error!("Received top-level Alert record: {}. Terminating.", alert); // Changed from warn
-                            return Err(format!("Received top-level alert: {:?}", alert.description));
+                            return Err(format!(
+                                "Received top-level alert: {:?}",
+                                alert.description
+                            ));
                         }
                         Err(e) => {
-                            error!("Failed to parse top-level Alert record: {}. Skipping record.", e);
-                            continue; 
+                            error!(
+                                "Failed to parse top-level Alert record: {}. Skipping record.",
+                                e
+                            );
+                            continue;
                         }
                     }
                 }
                 _ => {
                     warn!("Received unexpected record type {:?} while waiting for application data. Skipping record.", record.record_type);
-                    continue; 
+                    continue;
                 }
             }
         }
@@ -1427,9 +1436,9 @@ fn send_application_data(
 ) -> Result<(), String> {
     let mut plaintext_for_encryption = data.to_vec();
     // This line is critical for forming TLSInnerPlaintext correctly
-    plaintext_for_encryption.push(ContentType::ApplicationData as u8); 
+    plaintext_for_encryption.push(ContentType::ApplicationData as u8);
     // Encrypt the application data
-    let ciphertext = app_keys.encrypt_client_application_data(&plaintext_for_encryption)?; 
+    let ciphertext = app_keys.encrypt_client_application_data(&plaintext_for_encryption)?;
 
     // Create the TLS record
     let record = TLSRecord {
@@ -1585,20 +1594,22 @@ mod tests {
         incremental_manager.update(message1);
         incremental_manager.update(message2);
 
-        // Create a second manager and add both messages at once
-        let mut cumulative_manager = TranscriptManager::new();
+        // Create a combined version of the messages for later comparison of internal storage.
         let mut combined = Vec::new();
         combined.extend_from_slice(message1);
         combined.extend_from_slice(message2);
 
-        // This should NOT match because transcript hash is cumulative of separate messages
-        // not a single concatenated message
+        // Calculate the expected hash by feeding messages sequentially to a standard hasher.
+        // This represents the correct cumulative hash.
         let mut hasher = Sha256::new();
         hasher.update(&message1);
         hasher.update(&message2);
         let expected_hash = hasher.finalize().to_vec();
 
+        // Verify that the TranscriptManager's hash after incremental updates matches the expected cumulative hash.
         assert_eq!(incremental_manager.current_hash, expected_hash);
+        // Verify that the TranscriptManager stores messages as a list of individual messages,
+        // not as a list containing a single concatenated message.
         assert_ne!(incremental_manager.messages, vec![combined]);
     }
 

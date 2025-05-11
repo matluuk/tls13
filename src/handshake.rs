@@ -1,6 +1,6 @@
 //! This module contains the structures and implementations for the handshake messages.
 #![allow(clippy::module_name_repetitions)]
-use log::{debug, error, info, warn};
+use log::debug;
 use crate::extensions::{ByteSerializable, Extension, ExtensionOrigin};
 use crate::handshake::cipher_suites::CipherSuite;
 use crate::parser::ByteParser;
@@ -735,7 +735,6 @@ impl ByteSerializable for EncryptedExtensions {
 
 
 #[cfg(test)]
-#[ignore] // Ignore this test for now, as it is not verified as correct
 mod tests {
     use super::*;
     use crate::parser::ByteParser;
