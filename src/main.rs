@@ -6,6 +6,7 @@ use rasn::de;
 use std::collections::VecDeque;
 use std::io::{self, Read as SocketRead, Write as SocketWrite};
 use std::net::TcpStream;
+use std::thread::sleep;
 use std::time::Duration;
 use tls13tutorial::alert::Alert;
 use tls13tutorial::display::to_hex;
@@ -335,15 +336,24 @@ impl HandshakeKeys {
         debug!("Sequence number: {}", self.client_seq_num);
         debug!("Nonce: {}", to_hex(&nonce));
 
-        // In TLS 1.3, the additional authenticated data (AAD) is empty for the record protection
-        let aad = b"";
+        // Calculate record_length for AAD: length of (plaintext_with_inner_type + 16_byte_tag)
+        // This is the length that the TLSCiphertext.length field in the AAD will have.
+        let record_length_for_aad = u16::try_from(plaintext.len() + 16) // 16 bytes for Poly1305 tag
+            .map_err(|_| "Plaintext too long for record length calculation".to_string())?;
+
+        // In TLS 1.3, the additional authenticated data (AAD) is the TLS record header.
+        // For encrypted handshake messages, the outer record type is ApplicationData.
+        let mut aad = vec![ContentType::ApplicationData as u8];
+        aad.extend_from_slice(&TLS_VERSION_COMPATIBILITY.to_be_bytes());
+        aad.extend_from_slice(&record_length_for_aad.to_be_bytes());
+        debug!("AAD for client handshake encryption: {}", to_hex(&aad));
 
         // Encrypt the message
-        let ciphertext = match cipher.encrypt(
+        let ciphertext_and_tag = match cipher.encrypt(
             &nonce.into(),
             Payload {
-                msg: plaintext,
-                aad,
+                msg: plaintext, // This is the TLSInnerPlaintext (handshake message + content type byte)
+                aad: &aad,
             },
         ) {
             Ok(ct) => ct,
@@ -354,11 +364,11 @@ impl HandshakeKeys {
         self.client_seq_num += 1;
 
         debug!(
-            "Encryption successful, ciphertext length: {}",
-            ciphertext.len()
+            "Client handshake encryption successful, ciphertext length: {}",
+            ciphertext_and_tag.len()
         );
 
-        Ok(ciphertext)
+        Ok(ciphertext_and_tag)
     }
 }
 
@@ -748,6 +758,35 @@ fn main() {
                     &mut stream,
                 );
             }
+
+            // Add the application data exchange here
+            if handshake_complete {
+                info!("Handshake completed. Starting application data exchange.");
+
+                // Example: Send an HTTP GET request
+                let http_request = format!(
+                    "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                    hostname
+                );
+                send_application_data(
+                    &mut stream,
+                    app_keys.as_mut().unwrap(),
+                    http_request.as_bytes(),
+                )
+                .expect("Failed to send application data");
+
+                info!("Sent HTTP request:\n{}", http_request);
+                info!("HTTP request length: {}", http_request.as_bytes().len());
+
+                sleep(Duration::from_secs(10));
+
+                // Example: Receive the HTTP response
+                let response = receive_application_data(&mut stream, app_keys.as_mut().unwrap())
+                    .expect("Failed to receive application data");
+                info!("Received response:\n{}", String::from_utf8_lossy(&response));
+            } else {
+                error!("Handshake not completed. Cannot send application data.");
+            }
         }
         Err(e) => {
             error!("Failed to connect: {e}");
@@ -824,6 +863,7 @@ fn handle_tls_record(
                             handshake_keys,
                             stream,
                             handshake_complete,
+                            app_keys,
                         ),
                         // ContentType::Alert value (21)
                         21 => {
@@ -943,6 +983,7 @@ fn handle_tls_encrypted_handshake(
     handshake_keys: &mut HandshakeKeys,
     stream: &mut TcpStream,
     handshake_complete: &mut bool,
+    app_keys: &mut Option<ApplicationKeys>,
 ) {
     // Parse multiple handshake messages from the decrypted data
     let mut parser = ByteParser::from(inner_content.to_vec());
@@ -1018,8 +1059,13 @@ fn handle_tls_encrypted_handshake(
                             )
                             .expect("Failed to verify server Finished message");
 
-                            let app_keys = ApplicationKeys::new(&handshake_keys, &old_hash)
-                                .expect("Failed to derive application traffic keys");
+                            *app_keys = Some(
+                                ApplicationKeys::new(
+                                    handshake_keys,
+                                    transcript_manager.get_current_hash(),
+                                )
+                                .expect("Failed to derive application traffic keys"),
+                            );
 
                             // Mark handshake as complete
                             info!("Server Finished message received, sending Client Finished");
@@ -1029,8 +1075,12 @@ fn handle_tls_encrypted_handshake(
                                 .expect("Failed to send ChangeCipherSpec");
 
                             // Now create and send Client Finished
-                            send_client_finished(stream, handshake_keys, &old_hash)
-                                .expect("Failed to send Client Finished");
+                            send_client_finished(
+                                stream,
+                                handshake_keys,
+                                transcript_manager.get_current_hash(),
+                            )
+                            .expect("Failed to send Client Finished");
 
                             // Set handshake complete flag
                             *handshake_complete = true;
@@ -1250,6 +1300,152 @@ fn process_encrypted_extensions_message(
     }
 
     info!("EncryptedExtensions processed successfully");
+    Ok(())
+}
+
+fn receive_application_data(
+    stream: &mut TcpStream,
+    app_keys: &mut ApplicationKeys,
+) -> Result<Vec<u8>, String> {
+    loop { 
+        let buffer = process_tcp_stream(stream)
+            .map_err(|e| format!("Failed to read stream during application data reception: {}", e))?;
+
+        if buffer.is_empty() {
+            debug!("process_tcp_stream returned empty buffer while waiting for application data.");
+            return Err("No application data received with expected inner content type (stream empty or timed out after processing prior messages)".to_string());
+        }
+
+        let response_records = tls13tutorial::get_records(buffer.clone())
+            .map_err(|e| format!("Failed to process records during application data reception: {}", e))?;
+
+        if response_records.is_empty() && !buffer.is_empty() {
+            warn!(
+                "Received data ({} bytes) that could not be parsed into any TLS records. Raw data: {}. Continuing to read more.",
+                buffer.len(),
+                to_hex(&buffer.into_iter().collect::<Vec<u8>>())
+            );
+            continue; 
+        }
+
+        for record in response_records {
+            match record.record_type {
+                ContentType::ApplicationData => {
+                    let tls_inner_plaintext = match app_keys.decrypt_server_application_data(
+                        &record.fragment,
+                        record.record_type,
+                        record.legacy_record_version,
+                        record.length,
+                    ) {
+                        Ok(pt) => pt,
+                        Err(e) => {
+                            error!("Failed to decrypt ApplicationData record: {}. Skipping record.", e);
+                            continue; 
+                        }
+                    };
+
+                    if tls_inner_plaintext.is_empty() {
+                        warn!("Decrypted application data (TLSInnerPlaintext) is empty, skipping record.");
+                        continue;
+                    }
+
+                    let mut end_of_content = tls_inner_plaintext.len();
+                    while end_of_content > 0 && tls_inner_plaintext[end_of_content - 1] == 0 {
+                        end_of_content -= 1;
+                    }
+
+                    if end_of_content == 0 {
+                         warn!("Received TLSInnerPlaintext that appears to be all padding or invalid (no content type byte found). Skipping record.");
+                         continue;
+                    }
+                    
+                    let inner_content_type_val = tls_inner_plaintext[end_of_content - 1];
+                    let actual_payload = tls_inner_plaintext[..end_of_content - 1].to_vec();
+                    
+                    if inner_content_type_val == ContentType::ApplicationData as u8 {
+                        info!(
+                            "Received inner ApplicationData (type {}), payload length {}",
+                            inner_content_type_val, actual_payload.len()
+                        );
+                        info!(
+                            "Received application data (processed): {}", 
+                            String::from_utf8_lossy(&actual_payload)
+                        );
+                        return Ok(actual_payload); 
+                    } else if inner_content_type_val == ContentType::Handshake as u8 {
+                        warn!(
+                            "Received inner Handshake message (type {}) within ApplicationData record. Length: {}. Content: {}. Discarding and continuing to look for application data.",
+                            inner_content_type_val, actual_payload.len(), to_hex(&actual_payload)
+                        );
+                        continue; 
+                    } else if inner_content_type_val == ContentType::Alert as u8 {
+                        let alert_level = actual_payload.get(0).copied();
+                        let alert_description = actual_payload.get(1).copied();
+                        error!( // Changed from warn to error
+                            "Received inner Alert message (type {}) within ApplicationData record. Level: {:?}, Description: {:?}. Payload: {}",
+                            inner_content_type_val, alert_level, alert_description, to_hex(&actual_payload)
+                        );
+                        // All alerts in TLS 1.3 are fatal.
+                        return Err(format!(
+                            "Received fatal alert from server: level {:?}, description {:?}",
+                            alert_level, alert_description
+                        ));
+                    } else {
+                        warn!(
+                            "Received application data with unexpected inner content type: {}. Length: {}. Content: {}. Discarding and continuing to look for application data.",
+                            inner_content_type_val, actual_payload.len(), to_hex(&actual_payload)
+                        );
+                        continue; 
+                    }
+                }
+                ContentType::Alert => {
+                    match Alert::from_bytes(&mut record.fragment.clone().into()) {
+                        Ok(alert) => {
+                            error!("Received top-level Alert record: {}. Terminating.", alert); // Changed from warn
+                            return Err(format!("Received top-level alert: {:?}", alert.description));
+                        }
+                        Err(e) => {
+                            error!("Failed to parse top-level Alert record: {}. Skipping record.", e);
+                            continue; 
+                        }
+                    }
+                }
+                _ => {
+                    warn!("Received unexpected record type {:?} while waiting for application data. Skipping record.", record.record_type);
+                    continue; 
+                }
+            }
+        }
+        info!("Current batch of records processed. Attempting to read more application data.");
+    }
+}
+
+fn send_application_data(
+    stream: &mut TcpStream,
+    app_keys: &mut ApplicationKeys,
+    data: &[u8],
+) -> Result<(), String> {
+    let mut plaintext_for_encryption = data.to_vec();
+    // This line is critical for forming TLSInnerPlaintext correctly
+    plaintext_for_encryption.push(ContentType::ApplicationData as u8); 
+    // Encrypt the application data
+    let ciphertext = app_keys.encrypt_client_application_data(&plaintext_for_encryption)?; 
+
+    // Create the TLS record
+    let record = TLSRecord {
+        record_type: ContentType::ApplicationData,
+        legacy_record_version: TLS_VERSION_COMPATIBILITY,
+        length: u16::try_from(ciphertext.len()).expect("Ciphertext too long"),
+        fragment: ciphertext,
+    };
+
+    // Serialize and send the record
+    let record_bytes = record.as_bytes().expect("Failed to serialize TLS record");
+    stream
+        .write_all(&record_bytes)
+        .map_err(|e| format!("Failed to send application data: {}", e))?;
+
+    info!("Application data sent successfully");
     Ok(())
 }
 
