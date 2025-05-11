@@ -165,9 +165,6 @@ fn analyze_certificate_details(cert_data: &[u8]) -> Result<(), String> {
         Ok(c) => c,
         Err(e) => return Err(format!("Failed to parse certificate: {}", e)),
     };
-    
-    info!("Certificate Analysis:");
-    
     // Version
     info!("  Version: X.509v{}", cert.tbs_certificate.version.raw_value());
     
@@ -247,7 +244,8 @@ pub fn process_certificate_message(
     use webpki_roots::TLS_SERVER_ROOTS;
     use chrono::{Datelike, Timelike};
     
-    debug!("Validating certificate against hostname: {}", hostname);
+    info!("Validating certificate chain with {} certificates against hostname: {}", certificate.certificate_list.len(), hostname);
+
     for (i, cert) in certificate.certificate_list.iter().enumerate() {
         info!("Certificate #{} details:", i);
         analyze_certificate_details(&cert.certificate_data)?;
@@ -257,8 +255,6 @@ pub fn process_certificate_message(
         return Err("Empty certificate list received".to_string());
     }
 
-    info!("Received certificate chain with {} certificates", certificate.certificate_list.len());
-    
     // Extract the end-entity certificate (server's certificate)
     let server_cert = &certificate.certificate_list[0];
     let server_cert_data = &server_cert.certificate_data;
@@ -378,7 +374,7 @@ pub fn process_certificate_message(
     let Name::RdnSequence(ref rdn_sequence) = server_rasn_cert.tbs_certificate.subject;
     for attribute in rdn_sequence.to_vec() {
         if let Ok(name_string) = extract_common_name(&attribute) {
-            info!("Certificate Common Name: {}", name_string);
+            debug!("Certificate Common Name: {}", name_string);
             if name_string == hostname {
                 found_domain = true;
             }
@@ -406,7 +402,7 @@ pub fn process_certificate_message(
         return Err(format!("Certificate does not match hostname: {}", hostname));
     }
     
-    info!("Certificate matches hostname: {}", hostname);
+    debug!("Certificate matches hostname: {}", hostname);
     
     // 3. Certificate Chain Validation using webpki
     // Convert certificates to DER format for webpki
@@ -416,8 +412,8 @@ pub fn process_certificate_message(
     }
     
     // First, log information about the certificates
-    info!("Server certificate size: {} bytes", server_cert_data.len());
-    info!("Certificates in chain: {}", cert_chain.len());
+    debug!("Server certificate size: {} bytes", server_cert_data.len());
+    debug!("Certificates in chain: {}", cert_chain.len());
     for (i, cert) in cert_chain.iter().enumerate() {
         info!("  Chain cert {}: {} bytes", i, cert.len());
     }
@@ -452,7 +448,7 @@ pub fn process_certificate_message(
     );
 
     // Log the result of the chain validation
-    info!("Certificate chain validation result: {:?}", chain_result);
+    debug!("Certificate chain validation result: {:?}", chain_result);
     warn!("Certificate chain validation not fully implemented yet");
     
     // match chain_result {
@@ -511,7 +507,7 @@ pub fn verify_certificate_signature(
     transcript_hash: &[u8],
     certificate: &tls13tutorial::handshake::Certificate,
 ) -> Result<(), String> {
-    info!("Verifying server's signature");
+    debug!("Verifying server's signature");
     
     // Check that we have a certificate to validate against
     if certificate.certificate_list.is_empty() {
@@ -525,7 +521,7 @@ pub fn verify_certificate_signature(
     // Check the signature algorithm
     match cert_verify.algorithm {
         tls13tutorial::extensions::SignatureScheme::Ed25519 => {
-            info!("Signature algorithm is Ed25519");
+            debug!("Signature algorithm is Ed25519");
             
             // Extract the public key from the certificate
             let server_public_key = extract_ed25519_public_key(server_cert_data)?;

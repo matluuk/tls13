@@ -760,7 +760,7 @@ fn main() {
 
             // Add the application data exchange here
             if handshake_complete {
-                info!("Handshake completed. Starting application data exchange.");
+                info!("Starting application data exchange.");
 
                 // Example: Send an HTTP GET request
                 let http_request = format!(
@@ -775,9 +775,10 @@ fn main() {
                 .expect("Failed to send application data");
 
                 info!("Sent HTTP request:\n{}", http_request);
-                info!("HTTP request length: {}", http_request.as_bytes().len());
-
-                sleep(Duration::from_secs(10));
+                debug!("HTTP request length: {}", http_request.as_bytes().len());
+                
+                info!("Waiting for 5s to receive the response...");
+                sleep(Duration::from_secs(5));
 
                 // Example: Receive the HTTP response
                 let response = receive_application_data(&mut stream, app_keys.as_mut().unwrap())
@@ -819,7 +820,7 @@ fn handle_tls_record(
             // Application data received
             // Decrypt the data using the keys
             // Read TLSInnerPlaintext and proceed with the handshake
-            info!("Application data received, size of : {:?}", record.length);
+            debug!("Application data received with size : {:?}", record.length);
             assert_eq!(record.fragment.len(), record.length as usize);
 
             // Try to decrypt the record
@@ -845,7 +846,7 @@ fn handle_tls_record(
                     // Slice the plaintext to exclude the last byte (content type)
                     let inner_content = &plaintext[..plaintext.len() - 1];
 
-                    info!(
+                    debug!(
                         "Decrypted record: content type {} with {} bytes of data",
                         content_type,
                         inner_content.len()
@@ -937,7 +938,7 @@ fn handle_tls_content_type_handshake(
         // Early return if no compatible key share found
         let server_key_bytes = match server_key_share {
             Some(key_bytes) => {
-                info!("Found server's X25519 key share: {}", to_hex(key_bytes));
+                debug!("Found server's X25519 key share: {}", to_hex(key_bytes));
                 key_bytes
             }
             None => {
@@ -954,7 +955,7 @@ fn handle_tls_content_type_handshake(
         handshake_keys.dh_server_public = PublicKey::from(server_public_bytes);
 
         transcript_manager.update(&record.fragment);
-        info!(
+        debug!(
             "Transcript hash after ServerHello: {}",
             to_hex(transcript_manager.get_current_hash())
         );
@@ -990,7 +991,7 @@ fn handle_tls_encrypted_handshake(
         debug!("Parser remaining data: {} bytes", parser.len());
         match Handshake::from_bytes(&mut parser) {
             Ok(handshake) => {
-                info!("Decrypted handshake message: {:?}", handshake.msg_type);
+                debug!("Decrypted handshake message: {:?}", handshake.msg_type);
 
                 // Serialize the handshake message for the transcript
                 let handshake_bytes = handshake
@@ -1006,7 +1007,8 @@ fn handle_tls_encrypted_handshake(
                 // Handle different handshake message types
                 match handshake.msg_type {
                     HandshakeType::Certificate => {
-                        info!("Processing Certificate message");
+                        info!("Received Certificate message");
+                        debug!("Certificate message: {:?}", handshake.message);
                         if let HandshakeMessage::Certificate(certificate) = handshake.message {
                             debug!("Certificate: {:?}", certificate);
                             certificate::process_certificate_message(&certificate, hostname)
@@ -1017,7 +1019,8 @@ fn handle_tls_encrypted_handshake(
                         }
                     }
                     HandshakeType::CertificateVerify => {
-                        info!("Processing CertificateVerify message");
+                        info!("Received CertificateVerify message");
+                        debug!("CertificateVerify message: {:?}", handshake.message);
                         if let HandshakeMessage::CertificateVerify(cert_verify) = handshake.message
                         {
                             debug!("CertificateVerify received");
@@ -1037,7 +1040,8 @@ fn handle_tls_encrypted_handshake(
                         }
                     }
                     HandshakeType::EncryptedExtensions => {
-                        info!("Processing EncryptedExtensions message");
+                        info!("Received EncryptedExtensions message");
+                        debug!("EncryptedExtensions message: {:?}", handshake.message);
                         if let HandshakeMessage::EncryptedExtensions(extensions) = handshake.message
                         {
                             debug!("EncryptedExtensions: {:?}", extensions);
@@ -1046,7 +1050,7 @@ fn handle_tls_encrypted_handshake(
                         }
                     }
                     HandshakeType::Finished => {
-                        info!("Processing Finished message");
+                        info!("Received Finished message");
                         if let HandshakeMessage::Finished(finished) = handshake.message {
                             debug!("Finished: {:?}", finished);
 
@@ -1066,14 +1070,12 @@ fn handle_tls_encrypted_handshake(
                                 .expect("Failed to derive application traffic keys"),
                             );
 
-                            // Mark handshake as complete
-                            info!("Server Finished message received, sending Client Finished");
-
                             info!("Sending ChangeCipherSpec for compatibility");
                             send_change_cipher_spec(stream)
                                 .expect("Failed to send ChangeCipherSpec");
 
                             // Now create and send Client Finished
+                            info!("Sending Client Finished message");
                             send_client_finished(
                                 stream,
                                 handshake_keys,
@@ -1167,7 +1169,7 @@ fn send_change_cipher_spec(stream: &mut TcpStream) -> Result<(), String> {
         .write_all(&record_bytes)
         .map_err(|e| format!("Failed to send ChangeCipherSpec: {}", e))?;
 
-    info!("ChangeCipherSpec sent successfully");
+    debug!("ChangeCipherSpec sent successfully");
     Ok(())
 }
 
@@ -1225,7 +1227,7 @@ fn send_client_finished(
         .write_all(&record_bytes)
         .map_err(|e| format!("Failed to send Finished message: {}", e))?;
 
-    info!("Client Finished message sent successfully");
+    debug!("Client Finished message sent successfully");
     Ok(())
 }
 
@@ -1235,7 +1237,7 @@ fn process_encrypted_extensions_message(
     extensions: &tls13tutorial::handshake::EncryptedExtensions,
 ) -> Result<(), String> {
     if extensions.extensions.is_empty() {
-        info!("Empty EncryptedExtensions received (which is valid in TLS 1.3)");
+        info!("Empty EncryptedExtensions received");
         return Ok(());
     }
 
@@ -1454,7 +1456,7 @@ fn send_application_data(
         .write_all(&record_bytes)
         .map_err(|e| format!("Failed to send application data: {}", e))?;
 
-    info!("Application data sent successfully");
+    debug!("Application data sent successfully");
     Ok(())
 }
 
