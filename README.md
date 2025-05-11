@@ -1,121 +1,85 @@
 # TLS 1.3 protocol implementation in Rust
 
-This is an educational, partially incomplete project to learn about the TLS 1.3 protocol and the general challenges of
-implementing
-binary-level
-network protocols.
+This is my take on educational TLS 1.3 protocol excercise https://github.com/ouspg/tls13tutorial/ for University of Oulu course IC00AJ73 Cyber Security II: Cloud and Network Security 2025. My implementation is able to perform TLS 1.3 handshake and application data encryption and decryption. It covers server finished message verification and servers signature validation, but it doesn't verify certificates. The handshake is successfull with ciphersuite `TLS_CHACHA20_POLY1305_SHA256`
 
-The project attempts to follow the standard [RFC8466](https://datatracker.ietf.org/doc/html/rfc8446) as closely as
-possible in naming conventions and data structures when converting the standard into Rust implementation.
+# Demonstration
 
-The implementation is not likely the most efficient in terms of performance, or might not apply all the best
-cryptographic
-practices (e.g. constant times).
-It leaves cryptographic operations mostly for external libraries, and we just generate some cryptographically random
-bits.
+I have tested the implementation against openssl s_server:
 
-In this project, we are more interested in the TLS protocol at the byte level and how to implement decoders, create
-functional tests for them and integrate fuzzing straight from the beginning.
-
-Most of the data structures and their encoders have been provided. The logic to implement the complete handshake, error
-checking
-and decoding is left mostly for the student.
-Error checking is already at a good level, with some intentional flaws.
-
-The project currently supports:
-
-* `TLS_CHACHA20_POLY1305_SHA25` Cipher Suite
-* Key exchange with `X25519` and signatures with EdDSA (Elliptic Curve Diffie-Hellman key exchange using Curve25519 and
-  Edwards-Curve Digital Signature Algorithm based on the same curve)
-
-Credits to Michael Driscoll for his excellent [TLS 1.3 illustration](https://tls13.xargs.org/).
-
-## Quickstart for Rust
-
-We do not provide teaching for the language itself, but we can help on many issues.
-If you have programmed with any low-level language, you should be able to grasp the basics quickly, if the Rust is still
-unknown.
-
-If you fight with the compiler, it is just preventing potential bugs from the runtime instead.
-You have to adopt the idea that data is always owned by default.
-Read the chapter in Rust's book about [ownership.](https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html)
-
-This project attempts to avoid some complex features of Rust.
-You don't need to know lifetimes to complete the TLS handshake and decrypt application data content. It is okay to make
-additional copying (cloning!) on this project
-with the cost of performance and increased memory usage.
-
-For general guidance, check
-
-* [The Rust Book](https://doc.rust-lang.org/book/)
-* You can use ChatGPT, Claude, Copilot, or other LLMs, for example, to explain some complex lines of code. They are usually very
-  accurate.
-
-To get started with Rust environment, use [Rustup.](https://www.rust-lang.org/tools/install)
-
-It is also important to get your IDE environment properly set up. For a beginner, the most straight-forward ways are:
-
-* Use VSCode with [Rust Analyzer](https://code.visualstudio.com/docs/languages/rust).
-    * Configure
-      VSCode [to run `rustfmt` on save](https://stackoverflow.com/questions/67859926/how-to-run-cargo-fmt-on-save-in-vscode).
-    * After that, the editor should be able to note most problems in the code, and for example, to run single functional
-      tests from the IDE.
-    * You can also use [Clippy](https://doc.rust-lang.org/nightly/clippy/usage.html) to find issues in your code. You
-      can also configure VSCode to run it automatically in real-time, but it will take some resources.
-    * Additionally, if you want to try, you can also use a student license to run GitHub Copilot. But don't adapt code
-      pieces you don't understand. It also gives access to
-      using [GitHub Copilot Chat with your code](https://docs.github.com/en/copilot/github-copilot-chat/about-github-copilot-chat).
-      After that, you can even highlight specific code and ask questions or suggestions from the Copilot. But then
-      again, do not use things blindly. However, *it is extremely useful for this project, since we write some
-      repetitive code and do large pattern matching*.
-* Use the student license for [JetBrains RustRover.](https://www.jetbrains.com/rust/)
-    * You can apply the same as above also for RustRover.
-
-## Usage
-
-The program takes a single argument as a parameter.
-You can use the `RUST_LOG` environment variable to change the logging level. (one of `debug`, `info`, `warn`, `error`)
-
-To run with debug level and install dependencies, just
-
-```shell
-RUST_LOG=debug cargo run cloudflare.com:443
+Keygen
+```bash
+openssl genpkey -algorithm ED25519 -out server_key.pem
+openssl req -new -key server_key.pem -out server_cert.csr -subj "/CN=localhost"
+openssl req -x509 -key server_key.pem -in server_cert.csr -out server_cert.pem -days 365
+openssl x509 -in server_cert.pem -text -noout
 ```
 
-This will do a partial TLS 1.3 handshake with cloudflare.com
+```bash
+openssl s_server -accept 4433 -tls1_3 -key server_key.pem -cert server_cert.pem -sigalgs ed25519 -groups x25519 -no_resumption_on_reneg -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -msg -debug -trace -state -security_debug -security_debug_verbose
+```
 
-## What works?
+Now the tls client can be run
 
-It is very helpful to look at the process flow [here](https://tls13.xargs.org) to understand what is the current status.
+```
+RUST_LOG="info" cargo run localhost:4433
+```
 
-The project implements the necessary data structures and cryptographic primitives to create the initial `ClientHello`
-message and convert it into raw bytes with correct length determinants.
+The client sends hardcoded http request to server and waits 5 seconds before trying to read responce.
+`"GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n"`
 
-It also implements minimal data structures and decoders to parse the first TLS Record from the server response, which
-includes the `ServerHello` message. However, extensions are not parsed to correct structures.
-**They are left on purpose to give a somewhat easy starting point.**
 
-As a result, the following output log can be seen:
+Logs from successfull connection:
 
+openssl server
+```bash
+openssl s_server -accept 4433 -tls1_3 -key server_key.pem -cert server_cert.pem -sigalgs ed25519 -groups x25519 -ciphersuites TLS_CHACHA20_POLY1305_SHA
+256
+Using default temp DH parameters
+ACCEPT
+-----BEGIN SSL SESSION PARAMETERS-----
+MHMCAQECAgMEBAITAwQgxtnGU75Q/43lLhE7f5D/lv8TpKq+9JBirs+npwJz0oIE
+IO0fIIedLZMeljLC0UeTi1nYL6OTw5N6cWoUhX163fU+oQYCBGghBJWiBAICHCCk
+BgQEAQAAAK4HAgUAq3L8DbMDAgEd
+-----END SSL SESSION PARAMETERS-----
+Shared ciphers:TLS_CHACHA20_POLY1305_SHA256
+Signature Algorithms: Ed25519
+Shared Signature Algorithms: Ed25519
+Supported groups: x25519
+Shared groups: x25519
+CIPHER is TLS_CHACHA20_POLY1305_SHA256
+Secure Renegotiation IS NOT supported
+GET / HTTP/1.1
+Host: localhost
+Connection: close
+
+asd
+ERROR
+8084810A417F0000:error:0A000126:SSL routines:ssl3_read_n:unexpected eof while reading:ssl/record/rec_layer_s3.c:308:
+shutting down SSL
+CONNECTION CLOSED
+```
+
+Client
 ```scala
-RUST_BACKTRACE=1 RUST_LOG=info cargo run cloudflare.com:443
-    Finished dev [unoptimized + debuginfo] target(s) in 0.02s
-     Running `target/debug/tls13tutorial 'cloudflare.com:443'`
-     [INFO  tls13tutorial] Successfully connected to the server 'cloudflare.com:443'.
+RUST_LOG="info" cargo run localhost:4433
+   Compiling tls13tutorial v0.1.0 (/home/user/CyberSecurityII/tls1-3/tls13)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.18s
+     Running `target/debug/tls13tutorial 'localhost:4433'`
+[INFO  tls13tutorial] Successfully connected to the server 'localhost:4433'.
 [INFO  tls13tutorial] Sending ClientHello as follows...
-
-ClientHello, Length=163
+    
+ClientHello, Length=158
   client_version=0x303
   random (len=32): 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
   session_id (len=32): 000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
   cipher_suites (len=1)
     [0x13, 0x03] TLS_CHACHA20_POLY1305_SHA256
   compression_methods (len=1): 00
-  extensions (len=88)
+  extensions (len=83)
     extension_type=supported_versions(43), length=3
       data: 020304
-    extension_type=server_name(0), length=19
-      data: 001100000E636C6F7564666C6172652E636F6D
+    extension_type=server_name(0), length=14
+      data: 000C0000096C6F63616C686F7374
     extension_type=supported_groups(10), length=4
       data: 0002001D
     extension_type=signature_algorithms(13), length=4
@@ -124,201 +88,156 @@ ClientHello, Length=163
       data: 0024001D00208F40C5ADB68F25624AE5B214EA767A6EC94D829D3D7B5E1AD1BA6F3E2138285F
 
 [INFO  tls13tutorial] The handshake request has been sent...
-[INFO  tls13tutorial] Received 1448 bytes of data.
-[INFO  tls13tutorial] Received 1724 bytes of data.
+[WARN  tls13tutorial] TCP read blocking for more than 0.5 seconds...force return.
 [INFO  tls13tutorial] Response TLS Record received!
 [INFO  tls13tutorial] Response TLS Record received!
 [INFO  tls13tutorial] Response TLS Record received!
 [INFO  tls13tutorial] Response TLS Record received!
-[INFO  tls13tutorial] ServerHello message: ServerHello { legacy_version: 771, random: [169, 217, 208, 239, 149, 24, 213, 231, 132, 210, 235, 68, 75, 141, 242, 92, 239, 74, 79, 118, 237, 108, 111, 93, 25, 95, 50, 61, 29, 2, 80, 14], legacy_session_id_echo: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], cipher_suite: CipherSuite([19, 3]), legacy_compression_method: 0, extensions: [Extension { origin: Server, extension_type: KeyShare, extension_data: Unserialized([0, 29, 0, 32, 7, 76, 95, 86, 68, 123, 126, 243, 199, 19, 16, 66, 3, 141, 58, 133, 178, 8, 117, 33, 2, 209, 26, 85, 35, 103, 112, 213, 53, 126, 112, 17]) }, Extension { origin: Server, extension_type: SupportedVersions, extension_data: Unserialized([3, 4]) }] }
-[WARN  tls13tutorial] TODO: Implement the server hello message processing, and decoding of the rest of the extensions
-[ERROR tls13tutorial] Unexpected response type: ChangeCipherSpec
-[INFO  tls13tutorial] Application data received, size of : 3010
-[WARN  tls13tutorial] TODO: Decryption of the data and decoding of the all extensions not implemented
-[INFO  tls13tutorial] Application data received, size of : 19
-[WARN  tls13tutorial] TODO: Decryption of the data and decoding of the all extensions not implemented
+[INFO  tls13tutorial] Response TLS Record received!
+[INFO  tls13tutorial] Response TLS Record received!
+[INFO  tls13tutorial] ServerHello message received
+[INFO  tls13tutorial] Found server's X25519 key share: 2E7E14A6DCBB7D8B3B1B2CC5A4A39EA26709065BB3A21D1663DEF7A9F425155F
+[INFO  tls13tutorial] Handshake keys derived successfully
+[INFO  tls13tutorial] Received ChangeCipherSpec message (ignored in TLS 1.3)
+[INFO  tls13tutorial] Received EncryptedExtensions message
+[INFO  tls13tutorial] Empty EncryptedExtensions received
+[INFO  tls13tutorial] Received Certificate message
+[INFO  tls13tutorial::certificate] Validating certificate chain with 1 certificates against hostname: localhost
+[INFO  tls13tutorial::certificate] Certificate #0 details:
+[INFO  tls13tutorial::certificate]   Version: X.509v2
+[INFO  tls13tutorial::certificate]   Serial Number: 283285799878223556499282819846364792198606915509
+[INFO  tls13tutorial::certificate]   Signature Algorithm: ObjectIdentifier([1, 3, 101, 112])
+[INFO  tls13tutorial::certificate]   Issuer:
+[INFO  tls13tutorial::certificate]     CN: localhost
+[INFO  tls13tutorial::certificate]   Extensions:
+[INFO  tls13tutorial::certificate]     subjectKeyIdentifier: 22 bytes
+[INFO  tls13tutorial::certificate]     authorityKeyIdentifier: 24 bytes
+[INFO  tls13tutorial::certificate]     basicConstraints: 5 bytes (critical)
+[INFO  tls13tutorial::certificate] Certificate validity: 2025-05-11 20:07:40.0 +00:00:00 to 2026-05-11 20:07:40.0 +00:00:00
+[WARN  tls13tutorial::certificate] Certificate chain validation not fully implemented yet
+[INFO  tls13tutorial] Received CertificateVerify message
+[INFO  tls13tutorial::certificate] Ed25519 signature verified successfully
+[INFO  tls13tutorial] Received Finished message
+[INFO  tls13tutorial] Server Finished message verified successfully
+[INFO  tls13tutorial] Sending ChangeCipherSpec for compatibility
+[INFO  tls13tutorial] Sending Client Finished message
+[INFO  tls13tutorial] Handshake completed
+[INFO  tls13tutorial] Starting application data exchange.
+[INFO  tls13tutorial] Sent HTTP request:
+    GET / HTTP/1.1
+    Host: localhost
+    Connection: close
+    
+    
+[INFO  tls13tutorial] Waiting for 5s to receive the response...
+[WARN  tls13tutorial] TCP read blocking for more than 0.5 seconds...force return.
+[INFO  tls13tutorial] Response TLS Record received!
+[INFO  tls13tutorial] Response TLS Record received!
+[INFO  tls13tutorial] Response TLS Record received!
+[WARN  tls13tutorial] Received inner Handshake message (type 22) within ApplicationData record. Length: 217. Content: 040000D500001C200CAC573408000000000000000000C0E26A4D334F1F70DD69B16872091A0AA2FF4AFB03DF1C2334519FAD6C0ED03B0D326965DD3D1486D41CABEC9EFC34235612E2FBE139E8687F54D0C7A3A1BBA51F8027798D8DD23E0B0A0003EB84E5A80BDF60FA04A0A6785AA4F9DB8E17EDB73FEC20E0110D03D4DC44B37C3D2665CB47D9160EC68DBFCB6B5F7B114E25536E6984A0B2B06FB23CA0587628A2816A31D3AEFFF15F3768BE8099240BD923B820A9E02AD12B3ED7DFD1BD9F1747C3DE77EBBA996F16D9303DDFD1E624A5396B1F6F0000. Discarding and continuing to look for application data.
+[WARN  tls13tutorial] Received inner Handshake message (type 22) within ApplicationData record. Length: 217. Content: 040000D500001C206786696708000000000000000100C0E26A4D334F1F70DD69B16872091A0AA2BD5A5C93B3172BD94F01D79D62BEA8635526B0854F07D3F9B8F8ECD47C9215508B06FAD098DFF531BD1CB85CE84C97B074086F2062289CA1F7E853C3117ABECCB0A7D9DA3031CF9AB6CD84F26D5DAE76289BCAD1802F98F518F37E640B406B47B001C1FF49BA6F14D24ECB758768E21BAD950DA713D85D48CD5A9F9DEAA20EFB4D891BBF44F6FD4D3F9BBFA1F4D053AAE97D5532BB227462B3C673AD17DE980CD04BE5B28F5E5F4066A7FAE28D5164940000. Discarding and continuing to look for application data.
+[INFO  tls13tutorial] Received inner ApplicationData (type 23), payload length 4
+[INFO  tls13tutorial] Received application data (processed): asd
+    
+[INFO  tls13tutorial] Received response:
+    asd
 ```
 
-Since the server gets all the required information from the initial `ClientHello` request, it can start sending
-encrypted `ApplicationData`, which contains encrypted extensions and certificates.
+# Implementation details
 
-**The first steps to continue with the project are:**
+## Parser
+Parser improvements in `src/parser.rs`:
+- Check taht there is enough data for request
+- Added bound check in `get_bytes()`
+- Added debug functions for getting remaining data in deque `remaining_data()` and `remaining_data_hex`
 
-* Implement decoders for missing required extensions to fully construct the extension types.
-Currently, extensions types are identified but their inner data is left unparsed.
-* After that, you need to construct all the traffic keys for decrypting the rest of the handshake data.
-  Check [illustration](https://tls13.xargs.org/#server-handshake-keys-calc).
-    * Key Derivation functions are pre-implemented. You need to:
-        * Parse the server's public key and add it to the `HandshakeKeys` structure
-        * Calculate the transcript hash
-        * Use the `key_schedule` function to calculate the keys and use the keys afterward.
-        * Implement decrypting function for `CHACHA20_POLY1305_SHA256`. You can
-          use [this](https://docs.rs/chacha20poly1305/latest/chacha20poly1305/) dependency (already in the project). Note
-          the use of a sequence counter!
-        * Now you can decrypt and continue finishing the handshake process until the server provides session tickets,
-          and go as far as you like.
+Implemented byte parsing for tls extensions `src/extensions.rs`:
+- 0 - ServerName
+- 10 - SupportedGroups
+- 13 - SignatureAlgorithms
+- 51 - KeyShareServerHello or KeyShareClientHello
+- 43 - SupportedVersions 
+- 45 - PskKeyExchangeModes
 
-You can also see the documentation of this project in the browser.
-Run `cargo doc --open`.
-Documentation and `Display` formatting pull requests are welcome - and might even give some points.
+## Certificate handling
+Certificate handling `src/certificate.rs`:
+Following crates are used for certificate handling: `rasn` and `rasn-pkix` are used for converting ASN.1 DER-encoded certificates to Rust structures, `ed25519-dalek` have been used for signature verification, `time` is used for handling time in certificate verification.
+- Implemented server's signature verification using transcript hash and certificate `verify_certificate_signature()`
+- ed25519 public key extraction `extract_ed25519_public_key()` using `rasn` and `rasn-pkix`
+- Certificate validation have been tried using `webpki` `webpki-roots`. This doesn't work properly.
 
-## Type-Length-Value (TLV) pattern
+## Trabscript hash
+Transcript hash calculation is managed by the `TranscriptManager` struct in `src/main.rs`.
 
-In (binary) network communication
-protocols, [type-length-value or tag-length-value (TLV)](https://en.wikipedia.org/wiki/Type%E2%80%93length%E2%80%93value)
-is
-a common pattern, and TLS follows it in its many sub-protocols.
+-   **Initialization**: A new `TranscriptManager` starts with an empty list of messages and an empty hash.
+-   **Updating**: When a handshake message is processed, its raw byte representation is added to an internal list of messages. The `TranscriptManager` then recalculates the transcript hash by creating a new SHA-256 hasher, feeding it *all* handshake messages received or sent so far (in order), and finalizing the hash.
+-   **Usage**: The current transcript hash is retrieved using `get_current_hash()` and is used in key derivation (for handshake and application keys) and for verifying the server's `Finished` message and creating the client's `Finished` message.
 
-For example, the lowest layer in the TLS protocol uses the
-so-called [Record Protocol](https://datatracker.ietf.org/doc/html/rfc8446#section-5).
 
-It wraps the higher-level protocols, by following the idea of TLV.
-To see that in practice, we can take a look at the TLS
-Record [ASN.1 definition](https://datatracker.ietf.org/doc/html/rfc8446#appendix-B.1) and `TLSRecord` as an example
-of Rust data structure:
+## handshake keys
+The functions for deriving and using application keys are implemented to secure data exchanged after the handshake.
 
-```rust
-pub type ProtocolVersion = u16;
 
-// Max value is 255 (1 byte to represent)
-#[derive(Debug, Copy, Clone)]
-pub enum ContentType {
-    Invalid = 0,
-    ChangeCipherSpec = 20,
-    Alert = 21,
-    Handshake = 22,
-    ApplicationData = 23,
-}
+## Application keys
 
-#[derive(Debug, Clone)]
-pub struct TLSRecord {
-    pub record_type: ContentType,
-    // 2 bytes to represent
-    pub legacy_record_version: ProtocolVersion,
-    // length defined as 2 bytes. Maximum value is 2^14 or 2^14 + 256 depending on the `ContentType`
-    pub length: u16,
-    pub fragment: Vec<u8>, // fragment of size 'length'
-}
-```
+The `ApplicationKeys` struct in `src/main.rs` stores the symmetric keys and IVs used for encrypting and decrypting application data after the TLS handshake is complete. It also maintains separate sequence numbers for client and server data. The struct is pretty similar to the provided almost complete handshake keys struct.
 
-In the context of binary encoding, everything must have a size.
-The data should be possible to deserialize to the original structure based on the byte stream only.
-If we want to serialize the structure of `TLSRecord` into bytes, we go in order every field and create the byte
-presentation, as the TLS standard defines.
+Implementation details:
+-   **Structure**: It holds `client_app_key`, `client_app_iv`, `server_app_key`, and `server_app_iv`, all derived for the `CHACHA20_POLY1305_SHA256` cipher suite. It also includes `client_seq_num` and `server_seq_num` to track record sequence numbers for AEAD nonce construction.
+-   **Derivation**: The `ApplicationKeys::new()` method is responsible for deriving these keys. It takes the `HandshakeKeys` (which contain the Diffie-Hellman shared secret) and the final transcript hash as input.
+    -   It follows the TLS 1.3 key schedule:
+        1.  Re-derives the `early_secret` (as PSK is not used, it's derived from a salt of zeros).
+        2.  Derives a `derived_secret` from the `early_secret`.
+        3.  Extracts the `handshake_secret` using the `derived_secret` and the DH `shared_secret`.
+        4.  Derives another `derived_secret` (labeled "derived") from the `handshake_secret`.
+        5.  Extracts the `master_secret` using this new `derived_secret` and an empty key material (since there's no PSK).
+        6.  From the `master_secret` and the `transcript_hash`, it derives `client_application_traffic_secret_0` and `server_application_traffic_secret_0`.
+        7.  Finally, the actual `client_app_key`/`iv` and `server_app_key`/`iv` are derived from their respective traffic secrets using HKDF-Expand with "key" and "iv" labels.
+-   **Usage**: Instances of `ApplicationKeys` are used by `encrypt_client_application_data` and `decrypt_server_application_data` methods to secure the application data phase.
 
-* A record field takes 1 byte to present as the max value for `ContentType` is defined to be 255 (`u8`). In this case,
-  the
-  type defines the data content of
-  the `fragment` field. When you decode the byte stream, you know that the first byte is about `ContentType` and takes
-  one byte.
-* `ProtocolVersion` has type `u16` and that takes 2 bytes to present this number. On the lower level, we differ a bit
-  from
-  basic TLV as the version must be defined early.
-* The length of the `fragment` is presented with 2 bytes. Here it has a separate field, but that is not always the case
-  and
-  byte arrays with dynamic size should have always a length determinant.
-* `fragment` is an array of bytes with a total size `length` based on the length of the previous.
+## server finished message verification
+The server's `Finished` message is the first message authenticated with the newly negotiated keys. It confirms that the key exchange and authentication were successful.
 
-TLS Record protocol has the plaintext version and ciphertext version, depending on the content type and the stage when a
-record is being used.
+My implementation details:
+-   The `verify_server_finished` function in `src/main.rs` is responsible for this.
+-   It calculates the expected `verify_data` by computing an HMAC (using SHA-256) over the transcript hash of all handshake messages up to (but not including) the server's `Finished` message.
+-   The key used for this HMAC is the `server_finished_key`, which is derived from the `server_handshake_traffic_secret` (itself derived from the `handshake_secret`).
+-   The `server_handshake_traffic_secret` is obtained using the `derive_secret` function with the label "s hs traffic" and the `handshake_secret`. The `server_finished_key` is then derived from this traffic secret using the `derive_secret` function with the label "finished".
+-   The calculated `verify_data` is then compared with the `verify_data` received in the server's `Finished` message. A mismatch indicates a handshake failure.
 
-## Basics of implementing the decoders
+# Error handling
 
-The base project reads all the data from the TCP stream
-into the [VecDeque](https://doc.rust-lang.org/std/collections/struct.VecDeque.html) buffer.
-It might not be the most efficient way to parse bytes, but it allows taking chunks or single bytes without the need to
-move or
-clone the remaining data in the memory.
-From a learning point of view, it can be better than parsing traditional vectors or byte slices.
+The project utilizes Rust's `Result<T, E>` enum for error management.
+-   **I/O Operations**: Standard `std::io::Error` is handled for network communication, including timeouts and specific handling for non-blocking operations.
+-   **Protocol Logic**: Custom `String` errors are generally used for issues arising from TLS protocol parsing, cryptographic failures (e.g., decryption, signature verification), or unexpected message sequences. These errors are typically propagated, and critical failures lead to termination.
+-   **Alerts**: Received TLS Alert messages are processed. Fatal alerts, as per TLS 1.3 specification, will terminate the connection.
+-   **Logging**: The `log` crate is employed to output detailed error and warning messages
+-   **Resilience**: In some cases, such as during application data reception, the client attempts to recover from non-fatal errors (e.g., a single undecipherable record) by logging the issue and continuing to process further data, rather than immediately terminating.
+-   **Assertions**: `expect()` is used for conditions that should logically never fail, treating such occurrences as critical program errors.
 
-It provides methods such as `drain` or `pop_front` to consume parts from the buffer in the correct order.
-This is useful, for example, if we want to implement a decoder for a specific type. We consume as many bytes as needed to
-construct the object, and the leftover data is still in the original buffer, waiting to construct the follow-up object.
+# Unit testing:
 
-You can try to parse raw byte slices, but be warned about bugs! `VecDeque` can also panic with incorrect index usage.
-
-> [!Note]
-> There is already an abstraction for `VecDeque` to reduce the repetition of code in [parser.rs](src/parser.rs). You are
-> free to improve this further. There can be (intentional) bugs already. However, by using `Option` type, we already
-> note the most of the possible errors what can appear when extracting data from buffer.
-
-## Functional testing (positive and negative)
-
-Implementing functional tests in Rust can be
-done [to the same file as implementation](https://doc.rust-lang.org/book/ch11-01-writing-tests.html).
-
-This can be greatly beneficial; it is very easy to implement testing for your structs and their function implementations
-without ever needing to run the functionality through the main function in the development phase.
-
-To demonstrate testing, the alert protocol is the simplest sub-protocol in TLS.
-Take a look for [alert.rs](src/alert.rs) which implements the data structures and encoders and decoders. At the end of
-the file, there is a test module.
-If you have configured your IDE correctly, you should be able to click the play ▶
-button to run the single test function, for example, `test_alert_from_bytes`, or all the tests from the module at once.
-
-You can also do the same from the command line:
-
+Unittests can be run with
 ```shell
-cargo test alert::tests::test_alert_from_bytes
+cargo test
 ```
 
-Since the alert protocol uses only two bytes, it is straightforward to implement both positive tests and negative tests.
+There are some unittests for some modules. The unittests are mainly created by LLM:s and only briefly checked for most obvious mistakes. Current tests primarily cover aspects of:
+`src/extensions.rs`: serialization and deserialization of various extension types
+`src/certificates.rs`: public key extraction
+`src/main.rs`: transcript hash calculation and common name extraction
 
-If you wonder what the `impl std::fmt::Display for` means in the `Alert` data structures, it
-implements [a textual presentation for those objects](https://doc.rust-lang.org/rust-by-example/hello/print/print_display.html),
-for example, what is the output format when the `println!()` macro is used for the data type.
+# Fuzzing
 
-## Fuzzing the project
+Fuzzing for this project is not performed
 
-If you are using a Linux or macOS machine for development, starting fuzz testing with precise control is very
-straightforward.
-There are many fuzzing libraries, that can be integrated into the project to get coverage-guided fuzzing.
+# LLM usage
 
-Fuzzing provides the stream of bytes for the interface you choose, and depending on the used backend, it will provide
-testing data and coverage-guided mutation to test the robustness of the selected functionality.
+Throughout the development of this TLS 1.3 client, Large Language Models (LLMs), including GitHub Copilot, were utilized as an assistive tool. Their use included:
+-   Generating boilerplate code and initial implementations for some protocol structures and cryptographic operations.
+-   Assisting in debugging by suggesting potential causes for errors and offering solutions.
+-   Providing explanations for complex aspects of the TLS 1.3 protocol and cryptographic primitives.
+-   Helping to draft documentation and comments.
+-   Generating initial versions of unit tests for various modules.
 
-* [libfuzzer with `cargo-fuzz`](https://github.com/rust-fuzz/libfuzzer)
-* [libAFL](https://github.com/AFLplusplus/LibAFL)
-
-In the [fuzzing directory](fuzz), the `cargo fuzz` is pre-configured.
-As one fuzzing target, the `TLS Alert` protocol is used as an example.
-
-See [the project](https://github.com/rust-fuzz/cargo-fuzz) and
-its [documentation](https://rust-fuzz.github.io/book/cargo-fuzz/tutorial.html).
-
-You need to use a Linux or macOS environment with a `nightly` compiler for that.
-
-To start fuzzing, simply run
-
-```shell
-cargo fuzz run fuzz_target_1
-```
-
-The project has a dual target - see [src/lib.rs](src/lib.rs) which can be used as an interface for fuzzing (you can import
-everything defined in there to fuzz target).
-Modify as needed. You can already directly import other data structures for fuzzing.
-
-## Debugging and comparing to OpenSSL
-
-You can use Wireshark to check the first `ClientHello` and `ServerHello` messages.
-Data is mostly encrypted after these, but you can still see TLS Records with `Application Data` type afterward, while
-the inner
-content is encrypted.
-
-You can also see real, decrypted packets by using OpenSSL.
-
-```shell
-openssl genpkey -algorithm X25519 -out debug_key.pem # Generate X25519 negotiation key
-
-openssl s_client -connect cloudflare.com:443 -tls1_3 \
-                 -keylogfile secrets.log \
-                 -key debug_key.pem \
-                 -msg -msgfile messages.log \
-                 -state -ciphersuites TLS_CHACHA20_POLY1305_SHA256 \
-                 -debug \
-                 -trace -nocommands -tlsextdebug
-```
-
-You can see the handshake data in the `messages.log` file as unencrypted.
-
-Traffic secrets are in the `secrets.log` file.
+All LLM-generated code and suggestions were reviewed, tested, and modified as necessary to ensure correctness and fit within the project's architecture and requirements. The final implementation and logic are the result of this iterative process.
